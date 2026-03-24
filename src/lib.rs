@@ -21,6 +21,7 @@ use crate::db::queries;
 use crate::embed::EmbedHandle;
 use crate::error::Result;
 use crate::hnsw::VectorIndex;
+use crate::llm::LlmClient;
 use crate::types::*;
 
 /// The unified agent core. One struct, one SQLite file, one graph.
@@ -35,6 +36,9 @@ pub struct CortexEmbedded {
     pub auto_link_tx: async_channel::Sender<NodeId>,
     _auto_link_rx: async_channel::Receiver<NodeId>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Optional LLM client for background tasks (e.g. contradiction adjudication).
+    /// Set via `set_llm()` after construction.
+    llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
 }
 
 impl CortexEmbedded {
@@ -72,6 +76,8 @@ impl CortexEmbedded {
         let (auto_link_tx, auto_link_rx) = async_channel::bounded(1024);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+        let llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>> = Arc::new(RwLock::new(None));
+
         let cx = Self {
             db,
             embed,
@@ -80,12 +86,20 @@ impl CortexEmbedded {
             auto_link_tx,
             _auto_link_rx: auto_link_rx.clone(),
             shutdown_tx,
+            llm,
         };
 
         // 6. Start background tasks
         cx.start_background_tasks(auto_link_rx, shutdown_rx);
 
         Ok(cx)
+    }
+
+    /// Set the LLM client for background tasks (e.g. contradiction adjudication).
+    /// Call this after construction, once the LLM client is available.
+    pub async fn set_llm(&self, client: Arc<dyn LlmClient>) {
+        let mut guard = self.llm.write().await;
+        *guard = Some(client);
     }
 
     // ─── Core memory ────────────────────────────────────
@@ -224,13 +238,14 @@ impl CortexEmbedded {
         let db = self.db.clone();
         let hnsw = self.hnsw.clone();
         let config = self.config.clone();
+        let llm = self.llm.clone();
         let mut shutdown_rx2 = shutdown_rx.clone();
 
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Ok(node_id) = auto_link_rx.recv() => {
-                        let _ = auto_link_one(&db, &hnsw, &config, &node_id).await;
+                        let _ = auto_link_one(&db, &hnsw, &config, &llm, &node_id).await;
                     }
                     _ = shutdown_rx2.changed() => break,
                 }
@@ -240,6 +255,7 @@ impl CortexEmbedded {
         // Decay task
         let db = self.db.clone();
         let interval = std::time::Duration::from_secs(self.config.decay_interval_secs);
+        let decay_interval_secs = self.config.decay_interval_secs;
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -247,7 +263,7 @@ impl CortexEmbedded {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        let _ = run_decay(&db).await;
+                        let _ = run_decay(&db, decay_interval_secs).await;
                     }
                     _ = shutdown_rx.changed() => break,
                 }
@@ -294,10 +310,17 @@ async fn seed_identity(db: &Db) -> Result<()> {
 
 // ─── Auto-link ──────────────────────────────────────────
 
+/// Three-tier auto-link pipeline:
+///   1. cosine ≥ auto_link_threshold                → RelatesTo
+///   2. cosine ≥ contradiction_threshold + no negation keyword → RelatesTo only (no Contradicts)
+///   3. cosine ≥ contradiction_threshold + negation keyword →
+///      a. If LLM available → ask LLM to adjudicate → Contradicts only if LLM confirms
+///      b. If no LLM       → fall back to keyword-only → Contradicts
 async fn auto_link_one(
     db: &Db,
     hnsw: &Arc<RwLock<VectorIndex>>,
     config: &Config,
+    llm: &Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     node_id: &NodeId,
 ) -> Result<()> {
     // Get the node's embedding
@@ -327,7 +350,7 @@ async fn auto_link_one(
 
         let sim_f64 = similarity as f64;
 
-        // High similarity → RelatesTo edge
+        // Tier 1: High similarity → RelatesTo edge
         if sim_f64 >= config.auto_link_cosine_threshold {
             let src = node_id.clone();
             let dst = candidate_id.clone();
@@ -343,37 +366,90 @@ async fn auto_link_one(
             }
         }
 
-        // Very high similarity + negation heuristic → Contradicts
+        // Tier 2+3: Very high similarity — only consider Contradicts if negation detected
         if sim_f64 >= config.contradiction_cosine_threshold {
             let has_negation = detect_negation(&node, node_id, &candidate_id, db).await;
+
             if has_negation {
-                let src = node_id.clone();
-                let dst = candidate_id.clone();
-                let exists = db
-                    .call(move |conn| queries::edge_exists(conn, &src, &dst, EdgeKind::Contradicts))
-                    .await?;
-                if !exists {
-                    let edge =
-                        Edge::new(node_id.clone(), candidate_id.clone(), EdgeKind::Contradicts);
-                    db.call({
-                        let e = edge;
-                        move |conn| queries::insert_edge(conn, &e)
-                    })
-                    .await?;
-                    let a = node_id.clone();
-                    let b = candidate_id.clone();
-                    db.call(move |conn| queries::insert_contradiction(conn, &a, &b))
+                // Tier 3: negation keyword found — adjudicate via LLM if available
+                let is_contradiction = {
+                    let llm_guard = llm.read().await;
+                    if let Some(ref llm_client) = *llm_guard {
+                        adjudicate_contradiction(llm_client.as_ref(), &node, &candidate_id, db)
+                            .await
+                            .unwrap_or(true) // on LLM error, fall back to keyword result
+                    } else {
+                        true // no LLM available, trust keyword heuristic
+                    }
+                };
+
+                if is_contradiction {
+                    let src = node_id.clone();
+                    let dst = candidate_id.clone();
+                    let exists = db
+                        .call(move |conn| {
+                            queries::edge_exists(conn, &src, &dst, EdgeKind::Contradicts)
+                        })
                         .await?;
+                    if !exists {
+                        let edge = Edge::new(
+                            node_id.clone(),
+                            candidate_id.clone(),
+                            EdgeKind::Contradicts,
+                        );
+                        db.call({
+                            let e = edge;
+                            move |conn| queries::insert_edge(conn, &e)
+                        })
+                        .await?;
+                        let a = node_id.clone();
+                        let b = candidate_id.clone();
+                        db.call(move |conn| queries::insert_contradiction(conn, &a, &b))
+                            .await?;
+                    }
                 }
+                // else: LLM said not a contradiction — negation keyword was false positive
             }
+            // Tier 2: no negation keyword → already have RelatesTo from tier 1, skip Contradicts
         }
     }
 
     Ok(())
 }
 
+/// Ask the LLM whether two nodes genuinely contradict each other.
+/// Returns true if the LLM confirms contradiction, false otherwise.
+async fn adjudicate_contradiction(
+    llm: &dyn LlmClient,
+    node_a: &Node,
+    candidate_id: &NodeId,
+    db: &Db,
+) -> Result<bool> {
+    let cid = candidate_id.clone();
+    let candidate = db.call(move |conn| queries::get_node(conn, &cid)).await?;
+    let candidate = match candidate {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+
+    let text_a = node_a.body.as_deref().unwrap_or(&node_a.title);
+    let text_b = candidate.body.as_deref().unwrap_or(&candidate.title);
+
+    let prompt = format!(
+        "Do the following two statements contradict each other? \
+         Answer only YES or NO.\n\n\
+         Statement A: {text_a}\n\
+         Statement B: {text_b}"
+    );
+
+    let messages = vec![Message::user(prompt)];
+    let response = llm.complete(&messages).await?;
+    let answer = response.text.trim().to_uppercase();
+    Ok(answer.starts_with("YES"))
+}
+
 /// Simple negation heuristic: check if one node's body contains negation
-/// patterns relative to the other.
+/// patterns relative to the other. Used as a cheap pre-filter before LLM.
 async fn detect_negation(
     node: &Node,
     _node_id: &NodeId,
@@ -403,11 +479,22 @@ async fn detect_negation(
 
 // ─── Decay ──────────────────────────────────────────────
 
-async fn run_decay(db: &Db) -> Result<()> {
-    db.call(|conn| {
+/// Run proportional decay: compute how many decay intervals have elapsed
+/// since each node was last accessed, then apply `importance * (1 - rate)^steps`.
+/// This correctly handles offline gaps — if the agent was off for a week,
+/// the first sweep catches up by applying all missed steps at once.
+pub async fn run_decay(db: &Db, decay_interval_secs: u64) -> Result<()> {
+    db.call(move |conn| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let nodes = queries::get_decayable_nodes(conn)?;
-        for (id, importance, decay_rate) in nodes {
-            let new_importance = (importance * (1.0 - decay_rate)).max(0.01);
+        for (id, importance, decay_rate, last_access) in nodes {
+            let elapsed_secs = (now - last_access).max(0) as f64;
+            let interval = decay_interval_secs.max(1) as f64;
+            let steps = (elapsed_secs / interval).floor().max(1.0);
+            let new_importance = (importance * (1.0 - decay_rate).powf(steps)).max(0.01);
             queries::update_node_importance(conn, &id, new_importance)?;
         }
         Ok(())

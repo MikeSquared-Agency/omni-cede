@@ -181,20 +181,29 @@ pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(NodeId, Vec<f32>)>> 
 }
 
 /// Get stale nodes eligible for decay (not accessed in >24h, decay_rate > 0).
-pub fn get_decayable_nodes(conn: &Connection) -> Result<Vec<(NodeId, f64, f64)>> {
-    let cutoff = std::time::SystemTime::now()
+/// Returns (id, importance, decay_rate, last_access_epoch) so the caller can
+/// compute proportional decay based on actual wall-clock elapsed time.
+pub fn get_decayable_nodes(conn: &Connection) -> Result<Vec<(NodeId, f64, f64, i64)>> {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64
-        - 86400; // 24 hours
+        .as_secs() as i64;
+    let cutoff = now - 86400; // 24 hours
     let mut stmt = conn.prepare(
-        "SELECT id, importance, decay_rate FROM nodes
+        "SELECT id, importance, decay_rate,
+                COALESCE(last_access, created_at) AS la
+         FROM nodes
          WHERE decay_rate > 0.0
            AND (last_access IS NULL OR last_access < ?1)
            AND importance > 0.01",
     )?;
     let rows = stmt.query_map(params![cutoff], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
     })?;
     let mut result = Vec::new();
     for r in rows {

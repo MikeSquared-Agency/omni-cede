@@ -230,6 +230,7 @@ pub async fn run() -> crate::error::Result<()> {
             GraphAction::Explore => {
                 match build_llm_client(&ollama_spec) {
                     Ok(llm) => {
+                        cx.set_llm(llm.clone()).await;
                         let agent = crate::agent::orchestrator::Agent {
                             db: cx.db.clone(),
                             embed: cx.embed.clone(),
@@ -459,6 +460,7 @@ pub async fn run() -> crate::error::Result<()> {
 
         Commands::Chat => {
             let llm = build_llm_client(&ollama_spec)?;
+            cx.set_llm(llm.clone()).await;
             let agent = crate::agent::orchestrator::Agent {
                 db: cx.db.clone(),
                 embed: cx.embed.clone(),
@@ -533,6 +535,7 @@ pub async fn run() -> crate::error::Result<()> {
 
         Commands::Ask { query } => {
             let llm = build_llm_client(&ollama_spec)?;
+            cx.set_llm(llm.clone()).await;
             let agent = crate::agent::orchestrator::Agent {
                 db: cx.db.clone(),
                 embed: cx.embed.clone(),
