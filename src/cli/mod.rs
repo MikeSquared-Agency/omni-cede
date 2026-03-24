@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
+
+mod graph_viz;
+mod graph_tui;
 
 #[derive(Parser)]
 #[command(name = "cortex", about = "Embedded AI agent with graph memory")]
@@ -44,6 +48,12 @@ pub enum Commands {
         action: SessionAction,
     },
 
+    /// Visualize the knowledge graph in the terminal
+    Graph {
+        #[command(subcommand)]
+        action: Option<GraphAction>,
+    },
+
     /// Run trust consolidation
     Consolidate,
 
@@ -78,6 +88,18 @@ pub enum SessionAction {
     List,
     /// Show a specific session
     Show { session_id: String },
+}
+
+#[derive(Subcommand)]
+pub enum GraphAction {
+    /// Interactive graph explorer (TUI)
+    Explore,
+    /// Full graph overview
+    Overview,
+    /// Show ego network around a node (2 hops)
+    Ego { node_id: String },
+    /// Filter graph by node kind(s), comma-separated (e.g. soul,belief,fact)
+    Filter { kinds: String },
 }
 
 /// Run the CLI. Called from `src/bin/cortex.rs`.
@@ -204,6 +226,215 @@ pub async fn run() -> crate::error::Result<()> {
             }
         },
 
+        Commands::Graph { action } => match action.unwrap_or(GraphAction::Explore) {
+            GraphAction::Explore => {
+                match build_llm_client(&ollama_spec) {
+                    Ok(llm) => {
+                        let agent = crate::agent::orchestrator::Agent {
+                            db: cx.db.clone(),
+                            embed: cx.embed.clone(),
+                            hnsw: cx.hnsw.clone(),
+                            config: cx.config.clone(),
+                            llm: llm.clone(),
+                            tools: crate::tools::builtin_registry(
+                                cx.db.clone(),
+                                cx.embed.clone(),
+                                cx.hnsw.clone(),
+                                cx.auto_link_tx.clone(),
+                                Some(llm),
+                                cx.config.clone(),
+                            ),
+                            auto_link_tx: cx.auto_link_tx.clone(),
+                        };
+
+                        // Create session for the TUI chat
+                        let session = crate::types::Node::session("tui chat session");
+                        let session_id = session.id.clone();
+                        cx.db
+                            .call({
+                                let s = session.clone();
+                                move |conn| crate::db::queries::insert_node(conn, &s)
+                            })
+                            .await?;
+
+                        // Build initial briefing
+                        let brief = crate::memory::briefing_with_kinds(
+                            &cx.db,
+                            &cx.embed,
+                            &cx.hnsw,
+                            &cx.config,
+                            "tui chat session",
+                            &[
+                                crate::types::NodeKind::Soul,
+                                crate::types::NodeKind::Belief,
+                                crate::types::NodeKind::Goal,
+                                crate::types::NodeKind::Fact,
+                                crate::types::NodeKind::Decision,
+                                crate::types::NodeKind::Pattern,
+                            ],
+                            12,
+                        )
+                        .await?;
+
+                        let messages = vec![
+                            crate::types::Message::system(brief.context_doc),
+                        ];
+
+                        graph_tui::run_with_chat(cx.db.clone(), agent, session_id, messages)
+                            .await
+                            .map_err(|e| crate::error::CortexError::Config(format!("TUI error: {e}")))?;
+                    }
+                    Err(_) => {
+                        // No LLM configured — fall back to graph-only TUI
+                        eprintln!("No LLM configured — launching graph explorer without chat.");
+                        eprintln!("Set ANTHROPIC_API_KEY or use --ollama to enable chat.\n");
+                        let nodes = cx
+                            .db
+                            .call(|conn| crate::db::queries::get_all_nodes_light(conn))
+                            .await?;
+                        let edges = cx
+                            .db
+                            .call(|conn| crate::db::queries::get_all_edges(conn))
+                            .await?;
+                        graph_tui::run_interactive(nodes, edges)
+                            .map_err(|e| crate::error::CortexError::Config(format!("TUI error: {e}")))?;
+                    }
+                }
+                Ok(())
+            }
+            GraphAction::Overview => {
+                let nodes = cx
+                    .db
+                    .call(|conn| crate::db::queries::get_all_nodes_light(conn))
+                    .await?;
+                let edges = cx
+                    .db
+                    .call(|conn| crate::db::queries::get_all_edges(conn))
+                    .await?;
+                graph_viz::render_overview(&nodes, &edges);
+                Ok(())
+            }
+            GraphAction::Ego { node_id } => {
+                // Resolve partial id
+                let full_id = node_id.clone();
+                let center = cx
+                    .db
+                    .call({
+                        let id = full_id.clone();
+                        move |conn| crate::db::queries::get_node(conn, &id)
+                    })
+                    .await?;
+                let center = match center {
+                    Some(n) => n,
+                    None => {
+                        // Try prefix match
+                        let prefix = full_id.clone();
+                        let nodes = cx
+                            .db
+                            .call(move |conn| crate::db::queries::get_all_nodes_light(conn))
+                            .await?;
+                        match nodes.iter().find(|n| n.id.starts_with(&prefix)) {
+                            Some(n) => n.clone(),
+                            None => {
+                                eprintln!("Node not found: {node_id}");
+                                return Ok(());
+                            }
+                        }
+                    }
+                };
+
+                // Get 1-hop neighbors
+                let center_id = center.id.clone();
+                let edges = cx
+                    .db
+                    .call(|conn| crate::db::queries::get_all_edges(conn))
+                    .await?;
+
+                let mut neighbor_ids_1hop: Vec<(String, crate::types::EdgeKind, bool)> = Vec::new();
+                for e in &edges {
+                    if e.src == center_id {
+                        neighbor_ids_1hop.push((e.dst.clone(), e.kind, true));
+                    } else if e.dst == center_id {
+                        neighbor_ids_1hop.push((e.src.clone(), e.kind, false));
+                    }
+                }
+
+                // Load 1-hop neighbor nodes
+                let all_nodes = cx
+                    .db
+                    .call(|conn| crate::db::queries::get_all_nodes_light(conn))
+                    .await?;
+                let node_map: std::collections::HashMap<String, crate::types::Node> = all_nodes
+                    .into_iter()
+                    .map(|n| (n.id.clone(), n))
+                    .collect();
+
+                let mut neighbors_1hop: Vec<(crate::types::Node, crate::types::EdgeKind, bool)> =
+                    Vec::new();
+                for (id, ek, is_out) in &neighbor_ids_1hop {
+                    if let Some(node) = node_map.get(id) {
+                        neighbors_1hop.push((node.clone(), *ek, *is_out));
+                    }
+                }
+
+                // 2-hop neighbors
+                let mut neighbors_2hop: std::collections::HashMap<
+                    String,
+                    Vec<(crate::types::Node, crate::types::EdgeKind, bool)>,
+                > = std::collections::HashMap::new();
+                let hop1_ids: std::collections::HashSet<&str> =
+                    neighbor_ids_1hop.iter().map(|(id, _ek, _out): &(String, crate::types::EdgeKind, bool)| id.as_str()).collect();
+
+                for (n1_id, _, _) in &neighbor_ids_1hop {
+                    let mut hop2: Vec<(crate::types::Node, crate::types::EdgeKind, bool)> = Vec::new();
+                    for e in &edges {
+                        let (other_id, ek, is_out) = if e.src == *n1_id {
+                            (&e.dst, e.kind, true)
+                        } else if e.dst == *n1_id {
+                            (&e.src, e.kind, false)
+                        } else {
+                            continue;
+                        };
+                        // Skip center and other 1-hop nodes
+                        if *other_id == center_id || hop1_ids.contains(other_id.as_str()) {
+                            continue;
+                        }
+                        if let Some(node) = node_map.get(other_id) {
+                            hop2.push((node.clone(), ek, is_out));
+                        }
+                    }
+                    if !hop2.is_empty() {
+                        // Limit to 5 per 1-hop neighbor
+                        hop2.truncate(5);
+                        neighbors_2hop.insert(n1_id.clone(), hop2);
+                    }
+                }
+
+                graph_viz::render_ego(&center, &neighbors_1hop, &neighbors_2hop);
+                Ok(())
+            }
+            GraphAction::Filter { kinds } => {
+                let kind_list: Vec<crate::types::NodeKind> = kinds
+                    .split(',')
+                    .filter_map(|s| crate::types::NodeKind::from_str_opt(s.trim()))
+                    .collect();
+                if kind_list.is_empty() {
+                    eprintln!("No valid kinds. Options: soul, belief, goal, fact, entity, concept, decision, session, turn, pattern, ...");
+                    return Ok(());
+                }
+                let nodes = cx
+                    .db
+                    .call(|conn| crate::db::queries::get_all_nodes_light(conn))
+                    .await?;
+                let edges = cx
+                    .db
+                    .call(|conn| crate::db::queries::get_all_edges(conn))
+                    .await?;
+                graph_viz::render_filtered(&nodes, &edges, &kind_list);
+                Ok(())
+            }
+        },
+
         Commands::Consolidate => {
             let report = cx.consolidate().await?;
             println!("Consolidation complete:");
@@ -233,10 +464,51 @@ pub async fn run() -> crate::error::Result<()> {
                 embed: cx.embed.clone(),
                 hnsw: cx.hnsw.clone(),
                 config: cx.config.clone(),
-                llm,
-                tools: crate::tools::ToolRegistry::new(),
+                llm: llm.clone(),
+                tools: crate::tools::builtin_registry(
+                    cx.db.clone(),
+                    cx.embed.clone(),
+                    cx.hnsw.clone(),
+                    cx.auto_link_tx.clone(),
+                    Some(llm),
+                    cx.config.clone(),
+                ),
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
+
+            // Create a single session for the entire chat
+            let session = crate::types::Node::session("chat session");
+            let session_id = session.id.clone();
+            cx.db
+                .call({
+                    let s = session.clone();
+                    move |conn| crate::db::queries::insert_node(conn, &s)
+                })
+                .await?;
+
+            // Build initial briefing from memory
+            let brief = crate::memory::briefing_with_kinds(
+                &cx.db,
+                &cx.embed,
+                &cx.hnsw,
+                &cx.config,
+                "chat session",
+                &[
+                    crate::types::NodeKind::Soul,
+                    crate::types::NodeKind::Belief,
+                    crate::types::NodeKind::Goal,
+                    crate::types::NodeKind::Fact,
+                    crate::types::NodeKind::Decision,
+                    crate::types::NodeKind::Pattern,
+                ],
+                12,
+            )
+            .await?;
+
+            // Persistent message history for the whole chat
+            let mut messages = vec![
+                crate::types::Message::system(brief.context_doc),
+            ];
 
             println!("cortex chat — type 'exit' or Ctrl+C to quit\n");
             let stdin = io::stdin();
@@ -251,7 +523,7 @@ pub async fn run() -> crate::error::Result<()> {
                 if input == "exit" || input == "quit" {
                     break;
                 }
-                match agent.run(input).await {
+                match agent.run_turn(&session_id, &mut messages, input).await {
                     Ok(response) => println!("\n{response}\n"),
                     Err(e) => eprintln!("\nError: {e}\n"),
                 }
@@ -266,8 +538,15 @@ pub async fn run() -> crate::error::Result<()> {
                 embed: cx.embed.clone(),
                 hnsw: cx.hnsw.clone(),
                 config: cx.config.clone(),
-                llm,
-                tools: crate::tools::ToolRegistry::new(),
+                llm: llm.clone(),
+                tools: crate::tools::builtin_registry(
+                    cx.db.clone(),
+                    cx.embed.clone(),
+                    cx.hnsw.clone(),
+                    cx.auto_link_tx.clone(),
+                    Some(llm),
+                    cx.config.clone(),
+                ),
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
 
@@ -281,7 +560,7 @@ pub async fn run() -> crate::error::Result<()> {
 }
 
 /// Build an LLM client based on CLI flags and environment variables.
-fn build_llm_client(ollama_spec: &Option<String>) -> crate::error::Result<Box<dyn crate::llm::LlmClient>> {
+fn build_llm_client(ollama_spec: &Option<String>) -> crate::error::Result<Arc<dyn crate::llm::LlmClient>> {
     // Check for --ollama flag
     if let Some(ref ollama_spec) = ollama_spec {
         let (model, url) = if let Some(pos) = ollama_spec.find('@') {
@@ -289,14 +568,14 @@ fn build_llm_client(ollama_spec: &Option<String>) -> crate::error::Result<Box<dy
         } else {
             (ollama_spec.clone(), "http://localhost:11434".to_string())
         };
-        return Ok(Box::new(crate::llm::OllamaClient::new(model, url)));
+        return Ok(Arc::new(crate::llm::OllamaClient::new(model, url)));
     }
 
     // Check for ANTHROPIC_API_KEY
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         let model = std::env::var("ANTHROPIC_MODEL")
             .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-        return Ok(Box::new(crate::llm::AnthropicClient::new(key, model)));
+        return Ok(Arc::new(crate::llm::AnthropicClient::new(key, model)));
     }
 
     Err(crate::error::CortexError::Config(

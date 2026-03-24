@@ -9,6 +9,17 @@ use crate::types::*;
 pub trait LlmClient: Send + Sync {
     async fn complete(&self, messages: &[Message]) -> Result<LlmResponse>;
 
+    /// Complete with tool definitions available.
+    async fn complete_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[serde_json::Value],
+    ) -> Result<LlmResponse> {
+        // Default: ignore tools, just call complete
+        let _ = tools;
+        self.complete(messages).await
+    }
+
     /// Return the model name for recording in LlmCall nodes.
     fn model_name(&self) -> &str;
 }
@@ -65,7 +76,24 @@ impl AnthropicClient {
 #[async_trait::async_trait]
 impl LlmClient for AnthropicClient {
     async fn complete(&self, messages: &[Message]) -> Result<LlmResponse> {
-        // Split system message from conversation
+        self.call_api(messages, &[]).await
+    }
+
+    async fn complete_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[serde_json::Value],
+    ) -> Result<LlmResponse> {
+        self.call_api(messages, tools).await
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+}
+
+impl AnthropicClient {
+    fn build_messages(messages: &[Message]) -> (String, Vec<serde_json::Value>) {
         let system_msg = messages
             .iter()
             .find(|m| m.role == Role::System)
@@ -76,24 +104,48 @@ impl LlmClient for AnthropicClient {
             .iter()
             .filter(|m| m.role != Role::System)
             .map(|m| {
-                serde_json::json!({
-                    "role": match m.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "user", // tool results sent as user
-                        Role::System => unreachable!(),
-                    },
-                    "content": m.content,
-                })
+                let role = match m.role {
+                    Role::User | Role::Tool => "user",
+                    Role::Assistant => "assistant",
+                    Role::System => unreachable!(),
+                };
+                // Use raw content blocks if present (for tool_use/tool_result)
+                if let Some(ref blocks) = m.content_blocks {
+                    serde_json::json!({
+                        "role": role,
+                        "content": blocks,
+                    })
+                } else {
+                    serde_json::json!({
+                        "role": role,
+                        "content": m.content,
+                    })
+                }
             })
             .collect();
 
-        let body = serde_json::json!({
+        (system_msg, chat_messages)
+    }
+
+    async fn call_api(&self, messages: &[Message], tools: &[serde_json::Value]) -> Result<LlmResponse> {
+        let (system_msg, chat_messages) = Self::build_messages(messages);
+
+        let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": 4096,
             "system": system_msg,
             "messages": chat_messages,
         });
+
+        // Add tools if any are registered
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools.to_vec());
+        }
+
+        self.do_request(body).await
+    }
+
+    async fn do_request(&self, body: serde_json::Value) -> Result<LlmResponse> {
 
         let resp = self
             .client
@@ -130,6 +182,9 @@ impl LlmClient for AnthropicClient {
         let mut text = String::new();
         let mut tool_name = None;
         let mut tool_input = None;
+        let mut tool_use_id = None;
+        let mut tool_calls = Vec::new();
+        let raw_content = json.get("content").cloned();
 
         if let Some(content) = json["content"].as_array() {
             for block in content {
@@ -140,8 +195,16 @@ impl LlmClient for AnthropicClient {
                         }
                     }
                     Some("tool_use") => {
-                        tool_name = block["name"].as_str().map(String::from);
-                        tool_input = Some(block["input"].clone());
+                        let name = block["name"].as_str().unwrap_or("").to_string();
+                        let input = block["input"].clone();
+                        let id = block["id"].as_str().unwrap_or("").to_string();
+                        // Keep first tool_use for backward compat
+                        if tool_name.is_none() {
+                            tool_name = Some(name.clone());
+                            tool_input = Some(input.clone());
+                            tool_use_id = Some(id.clone());
+                        }
+                        tool_calls.push(ToolCall { id, name, input });
                     }
                     _ => {}
                 }
@@ -156,13 +219,12 @@ impl LlmClient for AnthropicClient {
             stop_reason,
             tool_name,
             tool_input,
+            tool_use_id,
+            tool_calls,
+            raw_content,
             input_tokens,
             output_tokens,
         })
-    }
-
-    fn model_name(&self) -> &str {
-        &self.model
     }
 }
 
@@ -231,6 +293,9 @@ impl LlmClient for OllamaClient {
             stop_reason: StopReason::EndTurn,
             tool_name: None,
             tool_input: None,
+            tool_use_id: None,
+            tool_calls: Vec::new(),
+            raw_content: None,
             input_tokens: 0,
             output_tokens: 0,
         })

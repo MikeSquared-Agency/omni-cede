@@ -240,7 +240,7 @@ impl Node {
     // ── Constructor helpers ─────────────────────────────
 
     pub fn session(input: &str) -> Self {
-        let preview = if input.len() > 60 { &input[..60] } else { input };
+        let preview: String = input.chars().take(60).collect();
         Node::new(NodeKind::Session, format!("Session: {preview}"))
             .with_body(input)
     }
@@ -251,8 +251,9 @@ impl Node {
     }
 
     pub fn fact_from_response(text: &str, _session_id: &NodeId) -> Self {
-        let title = if text.len() > 80 {
-            format!("{}…", &text[..80])
+        let title = if text.chars().count() > 80 {
+            let s: String = text.chars().take(80).collect();
+            format!("{s}…")
         } else {
             text.to_string()
         };
@@ -380,20 +381,67 @@ pub struct Message {
     pub role: Role,
     pub content: String,
     pub tool_call_id: Option<String>,
+    /// Raw content blocks for Anthropic tool-use protocol.
+    /// When present, these are sent instead of the `content` string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_blocks: Option<serde_json::Value>,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into(), tool_call_id: None }
+        Self { role: Role::System, content: content.into(), tool_call_id: None, content_blocks: None }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into(), tool_call_id: None }
+        Self { role: Role::User, content: content.into(), tool_call_id: None, content_blocks: None }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into(), tool_call_id: None }
+        Self { role: Role::Assistant, content: content.into(), tool_call_id: None, content_blocks: None }
     }
     pub fn tool_result(content: impl Into<String>) -> Self {
-        Self { role: Role::Tool, content: content.into(), tool_call_id: None }
+        Self { role: Role::Tool, content: content.into(), tool_call_id: None, content_blocks: None }
+    }
+    /// Create an assistant message with raw content blocks (for tool_use replay).
+    pub fn assistant_raw(blocks: serde_json::Value) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            content_blocks: Some(blocks),
+        }
+    }
+    /// Create a tool_result message with proper Anthropic content blocks.
+    pub fn tool_result_block(tool_use_id: &str, output: &str) -> Self {
+        Self {
+            role: Role::User,
+            content: output.to_string(),
+            tool_call_id: Some(tool_use_id.to_string()),
+            content_blocks: Some(serde_json::json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": output,
+                }
+            ])),
+        }
+    }
+    /// Create a user message with multiple tool_result blocks.
+    pub fn multi_tool_result_block(results: Vec<(String, String)>) -> Self {
+        let blocks: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(id, output)| {
+                serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": output,
+                })
+            })
+            .collect();
+        Self {
+            role: Role::User,
+            content: "tool results".to_string(),
+            tool_call_id: None,
+            content_blocks: Some(serde_json::Value::Array(blocks)),
+        }
     }
 }
 
@@ -410,8 +458,21 @@ pub struct LlmResponse {
     pub stop_reason: StopReason,
     pub tool_name: Option<String>,
     pub tool_input: Option<serde_json::Value>,
+    pub tool_use_id: Option<String>,
+    /// All tool_use calls in this response (for multi-tool invocations).
+    pub tool_calls: Vec<ToolCall>,
+    /// Raw content blocks from the API (for replaying in conversation).
+    pub raw_content: Option<serde_json::Value>,
     pub input_tokens: usize,
     pub output_tokens: usize,
+}
+
+/// A single tool invocation from an LLM response.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
 }
 
 // ─── Tool types ─────────────────────────────────────────

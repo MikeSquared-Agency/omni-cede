@@ -3,9 +3,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+
 use crate::db::Db;
 use crate::db::queries;
+use crate::embed::EmbedHandle;
 use crate::error::{CortexError, Result};
+use crate::hnsw::VectorIndex;
 use crate::types::*;
 
 /// A tool the agent can call. The handler is an async function that
@@ -123,4 +127,878 @@ impl ToolRegistry {
             .collect();
         serde_json::Value::Array(tools)
     }
+
+    /// Build Anthropic-format tool definitions for the API.
+    pub fn anthropic_tool_defs(&self) -> Vec<serde_json::Value> {
+        self.tools
+            .values()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect()
+    }
+}
+
+// ─── Built-in tools ─────────────────────────────────────
+
+/// Create a registry pre-loaded with the built-in cortex tools.
+/// Pass `llm` to enable the `delegate` tool (sub-agent spawning).
+/// Pass `None` to create a registry without delegation (used by sub-agents to prevent recursion).
+pub fn builtin_registry(
+    db: Db,
+    embed: EmbedHandle,
+    hnsw: Arc<RwLock<VectorIndex>>,
+    auto_link_tx: async_channel::Sender<crate::types::NodeId>,
+    llm: Option<Arc<dyn crate::llm::LlmClient>>,
+    config: crate::config::Config,
+) -> ToolRegistry {
+    let mut reg = ToolRegistry::new();
+
+    // ── remember: store a memory node into the graph ──
+    {
+        let db = db.clone();
+        let embed = embed.clone();
+        let hnsw = hnsw.clone();
+        let auto_link_tx = auto_link_tx.clone();
+        reg.register(Tool {
+            name: "remember".to_string(),
+            description: concat!(
+                "Store a memory node into long-term graph memory. Choose the right kind:\n",
+                "- Soul: core identity, purpose, values, personality traits\n",
+                "- Belief: things you believe to be true about the world\n",
+                "- Goal: objectives and aspirations\n",
+                "- Fact: concrete information, user preferences, learned data\n",
+                "- Entity: named things (people, places, projects)\n",
+                "- Concept: abstract ideas, categories, frameworks\n",
+                "- Decision: choices made and their rationale\n",
+                "- Pattern: recurring observations about behavior/interaction\n",
+                "- Limitation: known constraints or weaknesses\n",
+                "- Capability: skills, abilities, things you can do\n",
+                "Identity kinds (Soul, Belief, Goal) default to importance 1.0 and never decay."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the memory (e.g. 'User likes coffee')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Detailed content of the memory"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["Fact", "Entity", "Concept", "Decision", "Soul", "Belief", "Goal", "Pattern", "Limitation", "Capability"],
+                        "description": "The kind of memory node to create (default: Fact)"
+                    },
+                    "importance": {
+                        "type": "number",
+                        "description": "Importance 0.0-1.0 (identity kinds default to 1.0, others to 0.5)"
+                    }
+                },
+                "required": ["title", "body"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                let embed = embed.clone();
+                let hnsw = hnsw.clone();
+                let auto_link_tx = auto_link_tx.clone();
+                Box::pin(async move {
+                    let title = input["title"].as_str().unwrap_or("untitled").to_string();
+                    let body = input["body"].as_str().unwrap_or("").to_string();
+                    let kind_str = input["kind"].as_str().unwrap_or("Fact");
+                    let kind = match kind_str {
+                        "Soul" => NodeKind::Soul,
+                        "Belief" => NodeKind::Belief,
+                        "Goal" => NodeKind::Goal,
+                        "Entity" => NodeKind::Entity,
+                        "Concept" => NodeKind::Concept,
+                        "Decision" => NodeKind::Decision,
+                        "Pattern" => NodeKind::Pattern,
+                        "Limitation" => NodeKind::Limitation,
+                        "Capability" => NodeKind::Capability,
+                        _ => NodeKind::Fact,
+                    };
+
+                    // Identity kinds get high importance & no decay by default
+                    let is_identity = matches!(kind, NodeKind::Soul | NodeKind::Belief | NodeKind::Goal);
+                    let importance = input["importance"].as_f64()
+                        .unwrap_or(if is_identity { 1.0 } else { 0.5 });
+
+                    // Embed the text
+                    let text = format!("{} {}", &title, &body);
+                    let embedding = embed.embed(&text).await?;
+
+                    let mut node = Node::new(kind, title.clone())
+                        .with_body(&body)
+                        .with_trust(0.8);
+                    node.importance = importance;
+                    if is_identity {
+                        node.decay_rate = 0.0;
+                    }
+                    node.embedding = Some(embedding.clone());
+                    let node_id = node.id.clone();
+
+                    // Insert node
+                    db.call({
+                        let n = node.clone();
+                        move |conn| queries::insert_node(conn, &n)
+                    })
+                    .await?;
+
+                    // Index in HNSW
+                    {
+                        let mut idx = hnsw.write().await;
+                        idx.insert(node_id.clone(), embedding);
+                    }
+
+                    // Enqueue for auto-linking
+                    let _ = auto_link_tx.try_send(node_id.clone());
+
+                    Ok(ToolResult {
+                        output: format!("Remembered [{}]: '{}' (id: {})", kind_str, title, &node_id[..8]),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── recall: semantic search over graph memory ──
+    {
+        let db = db.clone();
+        let embed = embed.clone();
+        let hnsw = hnsw.clone();
+        reg.register(Tool {
+            name: "recall".to_string(),
+            description: "Search long-term graph memory for relevant information. Use this to look up things you've been told before, or to find facts, preferences, and decisions. Optionally filter by node kind.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for in memory"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default: 5)"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["Fact", "Entity", "Concept", "Decision", "Soul", "Belief", "Goal", "Pattern", "Limitation", "Capability"],
+                        "description": "Filter results to only this node kind (optional)"
+                    }
+                },
+                "required": ["query"]
+            }),
+            trust: 1.0,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                let embed = embed.clone();
+                let hnsw = hnsw.clone();
+                Box::pin(async move {
+                    let query = input["query"].as_str().unwrap_or("").to_string();
+                    let limit = input["limit"].as_u64().unwrap_or(5) as usize;
+                    let filter_kinds = input["kind"].as_str()
+                        .and_then(|s| NodeKind::from_str_opt(&s.to_lowercase()))
+                        .map(|k| vec![k]);
+
+                    let results = crate::memory::recall(
+                        &db,
+                        &embed,
+                        &hnsw,
+                        &crate::config::Config::default(),
+                        &query,
+                        RecallOptions {
+                            top_k: limit,
+                            filter_kinds,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+
+                    if results.is_empty() {
+                        return Ok(ToolResult {
+                            output: "No memories found matching that query.".to_string(),
+                            success: true,
+                        });
+                    }
+
+                    let mut out = String::new();
+                    for s in &results {
+                        out.push_str(&format!(
+                            "- [{}] {} (id: {}, trust: {:.2})\n  {}\n",
+                            s.node.kind,
+                            s.node.title,
+                            &s.node.id[..8],
+                            s.node.trust_score,
+                            s.node.body.as_deref().unwrap_or(""),
+                        ));
+                    }
+                    Ok(ToolResult {
+                        output: out,
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── update_memory: modify an existing node ──
+    {
+        let db = db.clone();
+        let embed = embed.clone();
+        let hnsw = hnsw.clone();
+        let auto_link_tx = auto_link_tx.clone();
+        reg.register(Tool {
+            name: "update_memory".to_string(),
+            description: "Update an existing memory node. Provide the node_id (or a unique prefix) and the fields to change. Only specified fields are updated.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Full node ID or unique prefix (at least 6 chars)"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "New title (optional)"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "New body content (optional)"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["Fact", "Entity", "Concept", "Decision", "Soul", "Belief", "Goal", "Pattern", "Limitation", "Capability"],
+                        "description": "Change the node kind (optional)"
+                    },
+                    "importance": {
+                        "type": "number",
+                        "description": "New importance 0.0-1.0 (optional)"
+                    }
+                },
+                "required": ["node_id"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                let embed = embed.clone();
+                let hnsw = hnsw.clone();
+                let auto_link_tx = auto_link_tx.clone();
+                Box::pin(async move {
+                    let raw_id = input["node_id"].as_str().unwrap_or("").to_string();
+                    if raw_id.len() < 6 {
+                        return Ok(ToolResult {
+                            output: "Error: node_id must be at least 6 characters.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Resolve prefix to full ID
+                    let full_id = {
+                        let rid = raw_id.clone();
+                        let matches = db.call(move |conn| queries::find_nodes_by_prefix(conn, &rid)).await?;
+                        match matches.len() {
+                            0 => return Ok(ToolResult {
+                                output: format!("No node found with prefix '{}'", raw_id),
+                                success: false,
+                            }),
+                            1 => matches.into_iter().next().unwrap(),
+                            n => return Ok(ToolResult {
+                                output: format!("Ambiguous prefix '{}' matches {} nodes. Use a longer ID.", raw_id, n),
+                                success: false,
+                            }),
+                        }
+                    };
+
+                    let new_kind = input["kind"].as_str().and_then(|s| NodeKind::from_str_opt(s));
+                    let new_title = input["title"].as_str();
+                    let new_body = input["body"].as_str();
+                    let new_importance = input["importance"].as_f64();
+
+                    // Update DB fields
+                    {
+                        let id = full_id.clone();
+                        let kind = new_kind;
+                        let title = new_title.map(|s| s.to_string());
+                        let body = new_body.map(|s| s.to_string());
+                        db.call(move |conn| {
+                            queries::update_node_fields(
+                                conn,
+                                &id,
+                                kind,
+                                title.as_deref(),
+                                body.as_deref(),
+                                new_importance,
+                                None,
+                            )
+                        })
+                        .await?;
+                    }
+
+                    // If title or body changed, re-embed
+                    if new_title.is_some() || new_body.is_some() {
+                        let id_for_fetch = full_id.clone();
+                        let node = db
+                            .call(move |conn| queries::get_node(conn, &id_for_fetch))
+                            .await?;
+                        if let Some(node) = node {
+                            let text = format!("{} {}", node.title, node.body.as_deref().unwrap_or(""));
+                            let embedding = embed.embed(&text).await?;
+                            let emb_blob: Vec<u8> =
+                                bytemuck::cast_slice::<f32, u8>(&embedding).to_vec();
+                            let id_for_emb = full_id.clone();
+                            db.call(move |conn| {
+                                conn.execute(
+                                    "UPDATE nodes SET embedding = ?1 WHERE id = ?2",
+                                    rusqlite::params![emb_blob, id_for_emb],
+                                )?;
+                                Ok(())
+                            })
+                            .await?;
+                            let mut idx = hnsw.write().await;
+                            idx.insert(full_id.clone(), embedding);
+                        }
+
+                        // Re-link after content change
+                        let _ = auto_link_tx.try_send(full_id.clone());
+                    }
+
+                    Ok(ToolResult {
+                        output: format!("Updated node {}", &full_id[..8]),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── delete_memory: remove a node from the graph ──
+    {
+        let db = db.clone();
+        let hnsw = hnsw.clone();
+        reg.register(Tool {
+            name: "delete_memory".to_string(),
+            description: "Delete a memory node and all its edges from the graph. Use the node_id or a unique prefix. This is permanent.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Full node ID or unique prefix (at least 6 chars)"
+                    }
+                },
+                "required": ["node_id"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                let hnsw = hnsw.clone();
+                Box::pin(async move {
+                    let raw_id = input["node_id"].as_str().unwrap_or("").to_string();
+                    if raw_id.len() < 6 {
+                        return Ok(ToolResult {
+                            output: "Error: node_id must be at least 6 characters.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Resolve prefix
+                    let full_id = {
+                        let rid = raw_id.clone();
+                        let matches = db.call(move |conn| queries::find_nodes_by_prefix(conn, &rid)).await?;
+                        match matches.len() {
+                            0 => return Ok(ToolResult {
+                                output: format!("No node found with prefix '{}'", raw_id),
+                                success: false,
+                            }),
+                            1 => matches.into_iter().next().unwrap(),
+                            n => return Ok(ToolResult {
+                                output: format!("Ambiguous prefix '{}' matches {} nodes. Use a longer ID.", raw_id, n),
+                                success: false,
+                            }),
+                        }
+                    };
+
+                    // Fetch title for confirmation message
+                    let title = {
+                        let id = full_id.clone();
+                        let node = db.call(move |conn| queries::get_node(conn, &id)).await?;
+                        node.map(|n| n.title).unwrap_or_else(|| "(unknown)".to_string())
+                    };
+
+                    // Delete from DB
+                    let id_del = full_id.clone();
+                    db.call(move |conn| queries::delete_node(conn, &id_del)).await?;
+
+                    // Remove from HNSW index
+                    {
+                        let mut idx = hnsw.write().await;
+                        idx.remove(&full_id);
+                    }
+
+                    Ok(ToolResult {
+                        output: format!("Deleted node '{}' ({})", title, &full_id[..8]),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── list_memories: enumerate nodes by kind ──
+    {
+        let db = db.clone();
+        reg.register(Tool {
+            name: "list_memories".to_string(),
+            description: "List memory nodes in the graph, optionally filtered by kind. Returns node IDs, titles, and metadata. Use this to browse and audit your memory rather than relying solely on semantic search.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["Fact", "Entity", "Concept", "Decision", "Soul", "Belief", "Goal", "Pattern", "Limitation", "Capability", "Session"],
+                        "description": "Filter to this node kind (optional — omit to list all)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (default: 20, max: 50)"
+                    }
+                },
+                "required": []
+            }),
+            trust: 1.0,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let kind = input["kind"].as_str()
+                        .and_then(|s| NodeKind::from_str_opt(&s.to_lowercase()));
+                    let limit = input["limit"].as_u64().unwrap_or(20).min(50) as usize;
+
+                    let nodes = db
+                        .call(move |conn| queries::list_nodes_filtered(conn, kind, limit))
+                        .await?;
+
+                    if nodes.is_empty() {
+                        return Ok(ToolResult {
+                            output: "No nodes found.".to_string(),
+                            success: true,
+                        });
+                    }
+
+                    let mut out = format!("{} node(s):\n", nodes.len());
+                    for n in &nodes {
+                        let ts = chrono::DateTime::from_timestamp(n.created_at, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        out.push_str(&format!(
+                            "- [{}] {} (id: {}, imp: {:.2}, created: {})\n",
+                            n.kind, n.title, &n.id[..8], n.importance, ts,
+                        ));
+                    }
+                    Ok(ToolResult { output: out, success: true })
+                })
+            }),
+        });
+    }
+
+    // ── memory_stats: graph health overview ──
+    {
+        let db = db.clone();
+        reg.register(Tool {
+            name: "memory_stats".to_string(),
+            description: "Get a summary of your memory graph: total nodes, edges, and count by node kind. Use this to understand the overall state of your memory.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+            trust: 1.0,
+            handler: Arc::new(move |_input| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let by_kind = db
+                        .call(|conn| queries::node_count_by_kind(conn))
+                        .await?;
+                    let total_edges = db
+                        .call(|conn| queries::edge_count(conn))
+                        .await?;
+
+                    let total_nodes: i64 = by_kind.values().sum();
+                    let mut out = format!(
+                        "Graph: {} nodes, {} edges\nBy kind:\n",
+                        total_nodes, total_edges
+                    );
+                    let mut kinds: Vec<_> = by_kind.iter().collect();
+                    kinds.sort_by(|a, b| b.1.cmp(a.1));
+                    for (kind, count) in kinds {
+                        out.push_str(&format!("  {}: {}\n", kind, count));
+                    }
+                    Ok(ToolResult { output: out, success: true })
+                })
+            }),
+        });
+    }
+
+    // ── bulk_delete: delete multiple nodes at once ──
+    {
+        let db = db.clone();
+        let hnsw = hnsw.clone();
+        reg.register(Tool {
+            name: "bulk_delete".to_string(),
+            description: concat!(
+                "Delete multiple memory nodes at once. Provide an array of node ID prefixes. ",
+                "Each prefix must be at least 6 characters. All matched nodes and their edges ",
+                "will be permanently removed. Use list_memories or recall first to find the IDs."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Array of node ID prefixes (at least 6 chars each)"
+                    }
+                },
+                "required": ["node_ids"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                let hnsw = hnsw.clone();
+                Box::pin(async move {
+                    let ids = input["node_ids"].as_array()
+                        .ok_or_else(|| CortexError::Tool("node_ids must be an array".into()))?
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>();
+
+                    if ids.is_empty() {
+                        return Ok(ToolResult {
+                            output: "No IDs provided.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Resolve all prefixes to full IDs
+                    let mut full_ids: Vec<NodeId> = Vec::new();
+                    let mut errors: Vec<String> = Vec::new();
+                    for raw_id in &ids {
+                        if raw_id.len() < 6 {
+                            errors.push(format!("'{}' too short (min 6 chars)", raw_id));
+                            continue;
+                        }
+                        let rid = raw_id.clone();
+                        let matches = db.call(move |conn| queries::find_nodes_by_prefix(conn, &rid)).await?;
+                        match matches.len() {
+                            0 => errors.push(format!("'{}' not found", raw_id)),
+                            1 => full_ids.push(matches.into_iter().next().unwrap()),
+                            n => errors.push(format!("'{}' ambiguous ({} matches)", raw_id, n)),
+                        }
+                    }
+
+                    // Delete resolved nodes
+                    let count = if !full_ids.is_empty() {
+                        let fids = full_ids.clone();
+                        db.call(move |conn| queries::delete_nodes_bulk(conn, &fids)).await?
+                    } else {
+                        0
+                    };
+
+                    // Remove from HNSW
+                    if !full_ids.is_empty() {
+                        let mut idx = hnsw.write().await;
+                        for id in &full_ids {
+                            idx.remove(id);
+                        }
+                    }
+
+                    let mut out = format!("Deleted {} node(s).", count);
+                    if !errors.is_empty() {
+                        out.push_str(&format!("\nSkipped: {}", errors.join(", ")));
+                    }
+                    Ok(ToolResult { output: out, success: count > 0 || errors.is_empty() })
+                })
+            }),
+        });
+    }
+
+    // ── purge_session: delete an entire session tree ──
+    {
+        let db = db.clone();
+        let hnsw = hnsw.clone();
+        reg.register(Tool {
+            name: "purge_session".to_string(),
+            description: concat!(
+                "Delete an entire session and all its children (iterations, LLM calls, tool calls, ",
+                "and derived facts). Use list_memories with kind=Session to find session IDs first. ",
+                "This is useful for cleaning up junk or test sessions."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session node ID or unique prefix (at least 6 chars)"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                let hnsw = hnsw.clone();
+                Box::pin(async move {
+                    let raw_id = input["session_id"].as_str().unwrap_or("").to_string();
+                    if raw_id.len() < 6 {
+                        return Ok(ToolResult {
+                            output: "Error: session_id must be at least 6 characters.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Resolve prefix
+                    let full_id = {
+                        let rid = raw_id.clone();
+                        let matches = db.call(move |conn| queries::find_nodes_by_prefix(conn, &rid)).await?;
+                        match matches.len() {
+                            0 => return Ok(ToolResult {
+                                output: format!("No node found with prefix '{}'", raw_id),
+                                success: false,
+                            }),
+                            1 => matches.into_iter().next().unwrap(),
+                            n => return Ok(ToolResult {
+                                output: format!("Ambiguous prefix '{}' matches {} nodes.", raw_id, n),
+                                success: false,
+                            }),
+                        }
+                    };
+
+                    // Verify it's a session node
+                    let node = {
+                        let id = full_id.clone();
+                        db.call(move |conn| queries::get_node(conn, &id)).await?
+                    };
+                    match &node {
+                        Some(n) if n.kind == NodeKind::Session => {},
+                        Some(n) => return Ok(ToolResult {
+                            output: format!("Node {} is a {}, not a session.", &full_id[..8], n.kind),
+                            success: false,
+                        }),
+                        None => return Ok(ToolResult {
+                            output: format!("Node {} not found.", &full_id[..8]),
+                            success: false,
+                        }),
+                    }
+
+                    // Collect entire session tree
+                    let tree_ids = {
+                        let sid = full_id.clone();
+                        db.call(move |conn| queries::collect_session_tree(conn, &sid)).await?
+                    };
+                    // Delete all nodes in tree
+                    let deleted = {
+                        let ids = tree_ids.clone();
+                        db.call(move |conn| queries::delete_nodes_bulk(conn, &ids)).await?
+                    };
+
+                    // Remove from HNSW
+                    {
+                        let mut idx = hnsw.write().await;
+                        for id in &tree_ids {
+                            idx.remove(id);
+                        }
+                    }
+
+                    let title = node.unwrap().title;
+                    Ok(ToolResult {
+                        output: format!(
+                            "Purged session '{}' ({}) — {} nodes deleted.",
+                            title, &full_id[..8], deleted
+                        ),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── current_time: return current date/time ──
+    reg.register(Tool {
+        name: "current_time".to_string(),
+        description: "Get the current date and time.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+        trust: 1.0,
+        handler: Arc::new(|_input| {
+            Box::pin(async move {
+                let now = chrono::Local::now();
+                Ok(ToolResult {
+                    output: now.format("%Y-%m-%d %H:%M:%S %Z").to_string(),
+                    success: true,
+                })
+            })
+        }),
+    });
+
+    // ── delegate: spawn a sub-agent for a focused task ──
+    if let Some(llm) = llm {
+        let db = db.clone();
+        let embed = embed.clone();
+        let hnsw = hnsw.clone();
+        let auto_link_tx = auto_link_tx.clone();
+        let config = config.clone();
+        reg.register(Tool {
+            name: "delegate".to_string(),
+            description: concat!(
+                "Spawn a sub-agent to handle a focused task independently. ",
+                "The sub-agent gets its own session, full memory access (recall/remember/etc), ",
+                "and runs up to max_iterations loops before returning its answer. ",
+                "Use this for tasks that need focused research, multi-step reasoning, ",
+                "or when you want to explore a topic without cluttering the main conversation. ",
+                "The sub-agent's work is recorded in the graph as a Delegation."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "What the sub-agent should do. Be specific and self-contained."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Additional context or constraints for the sub-agent (optional)"
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Max loops the sub-agent can run (default: 5, max: 10)"
+                    }
+                },
+                "required": ["task"]
+            }),
+            trust: 0.9,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                let embed = embed.clone();
+                let hnsw = hnsw.clone();
+                let auto_link_tx = auto_link_tx.clone();
+                let llm = llm.clone();
+                let config = config.clone();
+                Box::pin(async move {
+                    let task = input["task"].as_str().unwrap_or("").to_string();
+                    let context = input["context"].as_str().unwrap_or("").to_string();
+                    let max_iter = input["max_iterations"].as_u64()
+                        .unwrap_or(5)
+                        .min(10) as usize;
+
+                    if task.is_empty() {
+                        return Ok(ToolResult {
+                            output: "Error: task is required.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Build the full prompt for the sub-agent
+                    let full_task = if context.is_empty() {
+                        task.clone()
+                    } else {
+                        format!("{task}\n\nAdditional context: {context}")
+                    };
+
+                    // Write a Delegation node
+                    let delegation = Node::new(NodeKind::Delegation, format!("Delegate: {}", &task))
+                        .with_body(&full_task)
+                        .with_importance(0.4);
+                    let delegation_id = delegation.id.clone();
+                    db.call({
+                        let d = delegation.clone();
+                        move |conn| queries::insert_node(conn, &d)
+                    })
+                    .await?;
+
+                    // Build sub-agent config with capped iterations
+                    let mut sub_config = config.clone();
+                    sub_config.max_iterations = max_iter;
+
+                    // Sub-agent gets all tools EXCEPT delegate (llm=None prevents recursion)
+                    let sub_tools = builtin_registry(
+                        db.clone(),
+                        embed.clone(),
+                        hnsw.clone(),
+                        auto_link_tx.clone(),
+                        None,
+                        sub_config.clone(),
+                    );
+
+                    let sub_agent = crate::agent::orchestrator::Agent {
+                        db: db.clone(),
+                        embed: embed.clone(),
+                        hnsw: hnsw.clone(),
+                        config: sub_config,
+                        llm: llm.clone(),
+                        tools: sub_tools,
+                        auto_link_tx: auto_link_tx.clone(),
+                    };
+
+                    // Run the sub-agent
+                    let result = sub_agent.run(&full_task).await;
+
+                    match result {
+                        Ok(answer) => {
+                            // Write Synthesis node with the result
+                            let synthesis = Node::new(
+                                NodeKind::Synthesis,
+                                format!("Synthesis: {}", &task),
+                            )
+                            .with_body(&answer)
+                            .with_importance(0.6);
+                            let synthesis_id = synthesis.id.clone();
+                            db.call({
+                                let s = synthesis.clone();
+                                move |conn| queries::insert_node(conn, &s)
+                            })
+                            .await?;
+
+                            // Link: Synthesis ──DerivesFrom──▸ Delegation
+                            let edge = Edge::new(
+                                synthesis_id.clone(),
+                                delegation_id.clone(),
+                                EdgeKind::DerivesFrom,
+                            );
+                            db.call(move |conn| queries::insert_edge(conn, &edge)).await?;
+
+                            // Enqueue synthesis for auto-linking
+                            let _ = auto_link_tx.try_send(synthesis_id);
+
+                            Ok(ToolResult {
+                                output: format!(
+                                    "[Sub-agent completed]\n\n{}",
+                                    answer
+                                ),
+                                success: true,
+                            })
+                        }
+                        Err(e) => {
+                            Ok(ToolResult {
+                                output: format!("Sub-agent error: {e}"),
+                                success: false,
+                            })
+                        }
+                    }
+                })
+            }),
+        });
+    }
+
+    reg
 }

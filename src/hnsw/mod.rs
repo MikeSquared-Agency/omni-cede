@@ -51,6 +51,8 @@ pub struct VectorIndex {
     map_len: usize,
     /// Recent nodes not yet in the HNSW — searched via linear scan.
     buffer: Vec<(NodeId, Vec<f32>)>,
+    /// IDs deleted at runtime — filtered out of search results.
+    deleted: HashSet<NodeId>,
 }
 
 impl VectorIndex {
@@ -61,6 +63,7 @@ impl VectorIndex {
                 map: None,
                 map_len: 0,
                 buffer: vec![],
+                deleted: HashSet::new(),
             };
         }
 
@@ -75,6 +78,7 @@ impl VectorIndex {
             map: Some(map),
             map_len: len,
             buffer: vec![],
+            deleted: HashSet::new(),
         }
     }
 
@@ -84,12 +88,24 @@ impl VectorIndex {
             map: None,
             map_len: 0,
             buffer: vec![],
+            deleted: HashSet::new(),
         }
     }
 
     /// Add a new node to the linear buffer (not yet in HNSW).
     pub fn insert(&mut self, id: NodeId, embedding: Vec<f32>) {
+        // If previously deleted, un-delete
+        self.deleted.remove(&id);
+        // Remove any previous buffer entry for this ID
+        self.buffer.retain(|(eid, _)| eid != &id);
         self.buffer.push((id, embedding));
+    }
+
+    /// Mark a node as deleted. It will be filtered out of search results.
+    /// Buffer entries are removed immediately; HNSW entries are skipped.
+    pub fn remove(&mut self, id: &str) {
+        self.buffer.retain(|(eid, _)| eid != id);
+        self.deleted.insert(id.to_string());
     }
 
     /// How many items are waiting in the linear buffer.
@@ -117,8 +133,12 @@ impl VectorIndex {
         if let Some(ref map) = self.map {
             let q = EmbeddingPoint(query.to_vec());
             let mut search = Search::default();
-            for item in map.search(&q, &mut search).take(k) {
+            // Over-fetch to compensate for deleted entries
+            for item in map.search(&q, &mut search).take(k + self.deleted.len()) {
                 let node_id: &NodeId = item.value;
+                if self.deleted.contains(node_id) {
+                    continue;
+                }
                 let sim = 1.0 - item.distance;
                 if seen.insert(node_id.clone()) {
                     results.push((node_id.clone(), sim));
@@ -128,7 +148,7 @@ impl VectorIndex {
 
         // 2. Linear scan of buffer
         for (id, emb) in &self.buffer {
-            if seen.contains(id) {
+            if seen.contains(id) || self.deleted.contains(id) {
                 continue;
             }
             let sim = cosine_similarity(query, emb);

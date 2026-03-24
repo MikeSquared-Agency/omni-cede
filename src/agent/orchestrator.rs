@@ -20,7 +20,7 @@ pub struct Agent {
     pub embed: EmbedHandle,
     pub hnsw: Arc<RwLock<VectorIndex>>,
     pub config: Config,
-    pub llm: Box<dyn LlmClient>,
+    pub llm: Arc<dyn LlmClient>,
     pub tools: ToolRegistry,
     pub auto_link_tx: async_channel::Sender<NodeId>,
 }
@@ -85,9 +85,14 @@ impl Agent {
                 .call(move |conn| queries::insert_edge(conn, &edge))
                 .await?;
 
-            // LLM call
+            // LLM call — send tool definitions if any are registered
             let start = Instant::now();
-            let response = self.llm.complete(&messages).await?;
+            let tool_defs = self.tools.anthropic_tool_defs();
+            let response = if tool_defs.is_empty() {
+                self.llm.complete(&messages).await?
+            } else {
+                self.llm.complete_with_tools(&messages, &tool_defs).await?
+            };
             let latency_ms = start.elapsed().as_millis() as u64;
 
             // Record LlmCall node
@@ -119,20 +124,36 @@ impl Agent {
 
             match response.stop_reason {
                 StopReason::ToolUse => {
-                    let tool_name = response.tool_name.unwrap_or_default();
-                    let tool_input = response.tool_input.unwrap_or(serde_json::Value::Null);
-                    let result = self
-                        .tools
-                        .execute(
-                            &tool_name,
-                            tool_input,
-                            iter_id,
-                            &self.db,
-                            &self.auto_link_tx,
-                        )
-                        .await?;
-                    messages.push(Message::assistant(&response.text));
-                    messages.push(Message::tool_result(result.output));
+                    // Push assistant message with raw content blocks (includes all tool_use blocks)
+                    if let Some(raw) = response.raw_content.clone() {
+                        messages.push(Message::assistant_raw(raw));
+                    } else {
+                        messages.push(Message::assistant(&response.text));
+                    }
+
+                    // Execute ALL tool calls and collect results
+                    let mut tool_results: Vec<(String, String)> = Vec::new();
+                    for tc in &response.tool_calls {
+                        let result = self
+                            .tools
+                            .execute(
+                                &tc.name,
+                                tc.input.clone(),
+                                iter_id.clone(),
+                                &self.db,
+                                &self.auto_link_tx,
+                            )
+                            .await?;
+                        tool_results.push((tc.id.clone(), result.output));
+                    }
+
+                    // Push all tool results in a single user message
+                    if tool_results.len() == 1 {
+                        let (id, output) = tool_results.into_iter().next().unwrap();
+                        messages.push(Message::tool_result_block(&id, &output));
+                    } else {
+                        messages.push(Message::multi_tool_result_block(tool_results));
+                    }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens => {
                     // Store fact from response
@@ -185,6 +206,155 @@ impl Agent {
                 self.db
                     .call(move |conn| queries::insert_node(conn, &limit_node))
                     .await?;
+                break;
+            }
+        }
+
+        Ok("Reached iteration limit without final answer.".into())
+    }
+
+    /// Run a single turn within an ongoing chat session.
+    /// Takes the existing message history and appends the new user message.
+    /// Returns the assistant's response text.
+    pub async fn run_turn(
+        &self,
+        session_id: &NodeId,
+        messages: &mut Vec<Message>,
+        input: &str,
+    ) -> Result<String> {
+        // Append user message
+        messages.push(Message::user(input));
+
+        let mut iter: usize = 0;
+
+        loop {
+            iter += 1;
+
+            // Write LoopIteration node
+            let iter_node = Node::loop_iteration(iter, session_id);
+            let iter_id = iter_node.id.clone();
+            self.db
+                .call({
+                    let n = iter_node.clone();
+                    move |conn| queries::insert_node(conn, &n)
+                })
+                .await?;
+
+            let edge = Edge::new(iter_id.clone(), session_id.to_string(), EdgeKind::PartOf);
+            self.db
+                .call(move |conn| queries::insert_edge(conn, &edge))
+                .await?;
+
+            // LLM call
+            let start = Instant::now();
+            let tool_defs = self.tools.anthropic_tool_defs();
+            let response = if tool_defs.is_empty() {
+                self.llm.complete(messages).await?
+            } else {
+                self.llm.complete_with_tools(messages, &tool_defs).await?
+            };
+            let latency_ms = start.elapsed().as_millis() as u64;
+
+            // Record LlmCall node
+            let llm_node = Node {
+                kind: NodeKind::LlmCall,
+                title: format!("LLM call turn iter {iter}"),
+                body: Some(
+                    serde_json::json!({
+                        "model": self.llm.model_name(),
+                        "input_tokens": response.input_tokens,
+                        "output_tokens": response.output_tokens,
+                        "latency_ms": latency_ms,
+                    })
+                    .to_string(),
+                ),
+                ..Node::new(NodeKind::LlmCall, format!("LLM call turn iter {iter}"))
+            };
+            let llm_id = llm_node.id.clone();
+            self.db
+                .call({
+                    let n = llm_node;
+                    move |conn| queries::insert_node(conn, &n)
+                })
+                .await?;
+            let llm_edge = Edge::new(llm_id, iter_id.clone(), EdgeKind::PartOf);
+            self.db
+                .call(move |conn| queries::insert_edge(conn, &llm_edge))
+                .await?;
+
+            match response.stop_reason {
+                StopReason::ToolUse => {
+                    if let Some(raw) = response.raw_content.clone() {
+                        messages.push(Message::assistant_raw(raw));
+                    } else {
+                        messages.push(Message::assistant(&response.text));
+                    }
+
+                    let mut tool_results: Vec<(String, String)> = Vec::new();
+                    for tc in &response.tool_calls {
+                        let result = self
+                            .tools
+                            .execute(
+                                &tc.name,
+                                tc.input.clone(),
+                                iter_id.clone(),
+                                &self.db,
+                                &self.auto_link_tx,
+                            )
+                            .await?;
+                        tool_results.push((tc.id.clone(), result.output));
+                    }
+
+                    if tool_results.len() == 1 {
+                        let (id, output) = tool_results.into_iter().next().unwrap();
+                        messages.push(Message::tool_result_block(&id, &output));
+                    } else {
+                        messages.push(Message::multi_tool_result_block(tool_results));
+                    }
+                }
+                StopReason::EndTurn | StopReason::MaxTokens => {
+                    // Append assistant response to conversation history
+                    messages.push(Message::assistant(&response.text));
+
+                    // Store fact from response
+                    let fact = Node::fact_from_response(&response.text, session_id);
+                    let fact_id = fact.id.clone();
+                    self.db
+                        .call({
+                            let f = fact;
+                            move |conn| queries::insert_node(conn, &f)
+                        })
+                        .await?;
+                    let derives = Edge::new(
+                        fact_id.clone(),
+                        session_id.to_string(),
+                        EdgeKind::DerivesFrom,
+                    );
+                    self.db
+                        .call(move |conn| queries::insert_edge(conn, &derives))
+                        .await?;
+                    let _ = self.auto_link_tx.try_send(fact_id);
+
+                    // Context compaction
+                    if messages.len() > self.config.compaction_threshold {
+                        let _ = crate::compact_session(
+                            &self.db,
+                            &self.embed,
+                            &self.hnsw,
+                            &self.config,
+                            &self.auto_link_tx,
+                            session_id,
+                            messages,
+                            self.llm.as_ref(),
+                        )
+                        .await;
+                    }
+
+                    return Ok(response.text);
+                }
+            }
+
+            if iter >= self.config.max_iterations {
                 break;
             }
         }

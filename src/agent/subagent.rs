@@ -23,7 +23,7 @@ pub async fn spawn_subagent(
     embed: &EmbedHandle,
     hnsw: &Arc<RwLock<VectorIndex>>,
     config: &Config,
-    llm: Box<dyn LlmClient>,
+    llm: Arc<dyn LlmClient>,
     tools: ToolRegistry,
     auto_link_tx: async_channel::Sender<NodeId>,
 ) -> Result<SubAgentResult> {

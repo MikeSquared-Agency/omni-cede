@@ -330,6 +330,9 @@ async fn phase5_mock_llm_returns_scripted_responses() {
         stop_reason: StopReason::EndTurn,
         tool_name: None,
         tool_input: None,
+        tool_use_id: None,
+        tool_calls: Vec::new(),
+        raw_content: None,
         input_tokens: 10,
         output_tokens: 5,
     }]);
@@ -431,6 +434,9 @@ async fn phase7_agent_loop_end_to_end() {
         stop_reason: StopReason::EndTurn,
         tool_name: None,
         tool_input: None,
+        tool_use_id: None,
+        tool_calls: Vec::new(),
+        raw_content: None,
         input_tokens: 50,
         output_tokens: 10,
     }]);

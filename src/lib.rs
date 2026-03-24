@@ -269,9 +269,12 @@ async fn seed_identity(db: &Db) -> Result<()> {
         kind: NodeKind::Soul,
         title: "Core identity".into(),
         body: Some(
-            "I am an agent with persistent graph memory. \
-             I think carefully before acting. I know what I know, \
-             what I inferred, and what I was told. I surface uncertainty."
+            "You are an agent with a persistent memory graph. \
+             Your identity, beliefs, goals, knowledge, and capabilities \
+             are stored as nodes in this graph — use your recall tool to \
+             look them up. Use your remember tool to store new things about \
+             yourself. You can update or delete any memory, including this \
+             soul node. The graph is you — shape it as you learn."
                 .into(),
         ),
         importance: 1.0,
@@ -283,27 +286,8 @@ async fn seed_identity(db: &Db) -> Result<()> {
     db.call(move |conn| queries::insert_node(conn, &soul))
         .await?;
 
-    let belief = Node::new(NodeKind::Belief, "Provenance matters")
-        .with_body("Every fact should trace back to its source. Trust is earned, not assumed.")
-        .with_importance(1.0)
-        .with_decay_rate(0.0);
-    let belief_id = belief.id.clone();
-    db.call(move |conn| queries::insert_node(conn, &belief))
-        .await?;
-
-    let belief2 = Node::new(NodeKind::Belief, "Uncertainty is valuable")
-        .with_body("Knowing what I don't know is as important as knowing what I do.")
-        .with_importance(1.0)
-        .with_decay_rate(0.0);
-    db.call({
-        let b = belief2;
-        move |conn| queries::insert_node(conn, &b)
-    })
-    .await?;
-
-    // Link beliefs to soul
-    let e1 = Edge::new(belief_id, soul_id.clone(), EdgeKind::PartOf);
-    db.call(move |conn| queries::insert_edge(conn, &e1)).await?;
+    // No pre-seeded beliefs — the agent forms its own through interaction.
+    let _ = soul_id;
 
     Ok(())
 }

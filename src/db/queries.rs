@@ -203,6 +203,192 @@ pub fn get_decayable_nodes(conn: &Connection) -> Result<Vec<(NodeId, f64, f64)>>
     Ok(result)
 }
 
+/// Update selected fields on a node. Only non-None values are written.
+pub fn update_node_fields(
+    conn: &Connection,
+    id: &str,
+    kind: Option<NodeKind>,
+    title: Option<&str>,
+    body: Option<&str>,
+    importance: Option<f64>,
+    trust_score: Option<f64>,
+) -> Result<bool> {
+    let mut sets: Vec<String> = Vec::new();
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut idx = 1u32;
+
+    if let Some(k) = kind {
+        sets.push(format!("kind = ?{idx}"));
+        params_vec.push(Box::new(k.as_str().to_string()));
+        idx += 1;
+    }
+    if let Some(t) = title {
+        sets.push(format!("title = ?{idx}"));
+        params_vec.push(Box::new(t.to_string()));
+        idx += 1;
+    }
+    if let Some(b) = body {
+        sets.push(format!("body = ?{idx}"));
+        params_vec.push(Box::new(b.to_string()));
+        idx += 1;
+    }
+    if let Some(imp) = importance {
+        sets.push(format!("importance = ?{idx}"));
+        params_vec.push(Box::new(imp));
+        idx += 1;
+    }
+    if let Some(ts) = trust_score {
+        sets.push(format!("trust_score = ?{idx}"));
+        params_vec.push(Box::new(ts));
+        idx += 1;
+    }
+
+    if sets.is_empty() {
+        return Ok(false);
+    }
+
+    let sql = format!("UPDATE nodes SET {} WHERE id = ?{idx}", sets.join(", "));
+    params_vec.push(Box::new(id.to_string()));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|b| b.as_ref()).collect();
+    let changed = conn.execute(&sql, &*param_refs)?;
+    Ok(changed > 0)
+}
+
+/// Delete a node and its related edges / contradictions.
+pub fn delete_node(conn: &Connection, id: &str) -> Result<bool> {
+    conn.execute(
+        "DELETE FROM edges WHERE src = ?1 OR dst = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM contradictions WHERE node_a = ?1 OR node_b = ?1",
+        params![id],
+    )?;
+    let deleted = conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
+    Ok(deleted > 0)
+}
+
+/// Find node IDs matching a prefix (useful for short-ID resolution).
+pub fn find_nodes_by_prefix(conn: &Connection, prefix: &str) -> Result<Vec<NodeId>> {
+    let pattern = format!("{}%", prefix);
+    let mut stmt = conn.prepare("SELECT id FROM nodes WHERE id LIKE ?1")?;
+    let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+/// List nodes with optional kind filter, ordered by created_at desc.
+/// Returns lightweight nodes (no embeddings).
+pub fn list_nodes_filtered(
+    conn: &Connection,
+    kind: Option<NodeKind>,
+    limit: usize,
+) -> Result<Vec<Node>> {
+    let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match kind {
+        Some(k) => (
+            "SELECT id, kind, title, body, importance, trust_score,
+                    access_count, created_at, last_access, decay_rate
+             FROM nodes WHERE kind = ?1
+             ORDER BY created_at DESC LIMIT ?2"
+                .to_string(),
+            vec![Box::new(k.as_str().to_string()) as Box<dyn rusqlite::types::ToSql>,
+                 Box::new(limit as i64)],
+        ),
+        None => (
+            "SELECT id, kind, title, body, importance, trust_score,
+                    access_count, created_at, last_access, decay_rate
+             FROM nodes
+             ORDER BY created_at DESC LIMIT ?1"
+                .to_string(),
+            vec![Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>],
+        ),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(&*param_refs, |row| {
+        let kind_str: String = row.get(1)?;
+        Ok(Node {
+            id: row.get(0)?,
+            kind: NodeKind::from_str_opt(&kind_str).unwrap_or(NodeKind::Fact),
+            title: row.get(2)?,
+            body: row.get(3)?,
+            importance: row.get(4)?,
+            trust_score: row.get(5)?,
+            access_count: row.get(6)?,
+            created_at: row.get(7)?,
+            last_access: row.get(8)?,
+            decay_rate: row.get(9)?,
+            embedding: None,
+        })
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+/// Collect all node IDs reachable from a session via PartOf and DerivesFrom edges.
+/// This walks the session tree: Session → LoopIteration → LlmCall/ToolCall → Facts.
+pub fn collect_session_tree(conn: &Connection, session_id: &str) -> Result<Vec<NodeId>> {
+    let mut visited: Vec<NodeId> = vec![session_id.to_string()];
+    let mut frontier: Vec<NodeId> = vec![session_id.to_string()];
+
+    while !frontier.is_empty() {
+        let placeholders: Vec<String> = frontier
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT DISTINCT src FROM edges
+             WHERE dst IN ({}) AND kind IN ('part_of', 'derives_from')",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = frontier
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(&*params, |row| row.get::<_, String>(0))?;
+
+        let mut next_frontier = Vec::new();
+        for r in rows {
+            let id = r?;
+            if !visited.contains(&id) {
+                visited.push(id.clone());
+                next_frontier.push(id);
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    Ok(visited)
+}
+
+/// Bulk-delete multiple nodes and their edges/contradictions.
+pub fn delete_nodes_bulk(conn: &Connection, ids: &[NodeId]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut deleted = 0usize;
+    for id in ids {
+        conn.execute("DELETE FROM edges WHERE src = ?1 OR dst = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM contradictions WHERE node_a = ?1 OR node_b = ?1",
+            params![id],
+        )?;
+        deleted += conn.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
+    }
+    Ok(deleted)
+}
+
 // ─── Edge CRUD ──────────────────────────────────────────
 
 pub fn insert_edge(conn: &Connection, edge: &Edge) -> Result<()> {
@@ -365,6 +551,44 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
         params![key, value],
     )?;
     Ok(())
+}
+
+// ─── Bulk loads (for graph viz) ──────────────────────────
+
+pub fn get_all_nodes_light(conn: &Connection) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, title, body, importance, trust_score,
+                access_count, created_at, last_access, decay_rate
+         FROM nodes ORDER BY kind, importance DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let kind_str: String = row.get(1)?;
+        Ok(Node {
+            id: row.get(0)?,
+            kind: NodeKind::from_str_opt(&kind_str).unwrap_or(NodeKind::Fact),
+            title: row.get(2)?,
+            body: row.get(3)?,
+            importance: row.get(4)?,
+            trust_score: row.get(5)?,
+            access_count: row.get(6)?,
+            created_at: row.get(7)?,
+            last_access: row.get(8)?,
+            decay_rate: row.get(9)?,
+            embedding: None, // skip heavy blob
+        })
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+pub fn get_all_edges(conn: &Connection) -> Result<Vec<Edge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, src, dst, kind, weight, created_at, metadata FROM edges",
+    )?;
+    read_edges(&mut stmt, [])
 }
 
 // ─── Stats ──────────────────────────────────────────────
