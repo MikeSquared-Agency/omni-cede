@@ -1,20 +1,20 @@
 # omni-cede
 
-**Omnichannel self-aware agent. One API, every channel, one memory graph.**
+**Omnichannel AI agent powered by embedded memory graphs. One API, every channel, one graph.**
 
-omni-cede extends [cede](https://github.com/MikeSquared-Agency/cede) with an HTTP API, identity resolution, and per-channel session management. Connect WhatsApp, Telegram, Slack, Discord, or any custom integration — the agent remembers across all of them.
+omni-cede extends [cede](https://github.com/MikeSquared-Agency/cede) with an HTTP API, identity resolution, and per-channel session management — all backed by an embedded memory graph (single SQLite file, no external DB). Connect WhatsApp, Telegram, Slack, Discord, or any custom integration — the agent remembers across all of them because every interaction is a node in the same graph.
 
 ## Ecosystem
 
 ```
-cortex-embedded          <-- the engine (upstream)
+cortex-embedded          <-- embedded memory graph engine (upstream)
   |-- cede               <-- forkable starter kit
        |-- omni-cede     <-- you are here (omnichannel deployment)
 ```
 
 ## What omni-cede Adds
 
-On top of everything in cede (graph memory, hybrid recall, auto-linking, decay, tools, sub-agents, TUI), omni-cede adds:
+On top of everything in cede (embedded memory graph, hybrid recall, auto-linking, decay, tools, sub-agents, TUI), omni-cede adds:
 
 | Layer | What it does |
 |-------|-------------|
