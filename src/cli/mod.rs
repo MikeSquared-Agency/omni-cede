@@ -142,21 +142,30 @@ pub async fn run() -> crate::error::Result<()> {
             let api_key = std::env::var("API_KEY").ok();
 
             // ── Build the omnichannel pipeline + registry ──
-            let registry = crate::channels::ChannelRegistry::new(1024);
+            let mut registry = crate::channels::ChannelRegistry::new(1024);
 
-            // Register built-in channels
+            // Register built-in passive channels (always available)
             registry.register(std::sync::Arc::new(
                 crate::channels::webhook::WebhookChannel::new(),
             )).await;
             registry.register(std::sync::Arc::new(
-                crate::channels::telegram::TelegramChannel::new(),
-            )).await;
-            registry.register(std::sync::Arc::new(
-                crate::channels::discord::DiscordChannel::new(),
-            )).await;
-            registry.register(std::sync::Arc::new(
                 crate::channels::webchat::WebChatChannel::new(),
             )).await;
+
+            // Register active channels only if their tokens are configured
+            if std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
+                registry.register(std::sync::Arc::new(
+                    crate::channels::telegram::TelegramChannel::new(),
+                )).await;
+            }
+            if std::env::var("DISCORD_BOT_TOKEN").is_ok() {
+                registry.register(std::sync::Arc::new(
+                    crate::channels::discord::DiscordChannel::new(),
+                )).await;
+            }
+
+            // Take inbound receiver before moving registry into Arc
+            let inbound_rx = registry.take_inbound_rx();
 
             let registry = std::sync::Arc::new(registry);
             let pipeline = std::sync::Arc::new(
@@ -171,11 +180,75 @@ pub async fn run() -> crate::error::Result<()> {
                 registry,
             });
 
-            let app = crate::api::router(state);
+            let app = crate::api::router(state.clone());
             let addr = format!("{host}:{port}");
             println!("omni-cede API server listening on {addr}");
             if std::env::var("API_KEY").is_err() {
                 println!("  WARNING: API_KEY not set — auth disabled (dev mode)");
+            }
+
+            // ── Start channel adapters (Telegram polling, etc.) ──
+            {
+                let mut channel_configs = std::collections::HashMap::new();
+
+                // Telegram: auto-enable if TELEGRAM_BOT_TOKEN is set
+                if std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
+                    channel_configs.insert(
+                        "telegram".to_string(),
+                        serde_json::json!({ "mode": "polling" }),
+                    );
+                    println!("  Telegram: enabled (polling mode)");
+                }
+
+                // Discord: auto-enable if DISCORD_BOT_TOKEN is set
+                if std::env::var("DISCORD_BOT_TOKEN").is_ok() {
+                    channel_configs.insert(
+                        "discord".to_string(),
+                        serde_json::json!({}),
+                    );
+                    println!("  Discord: enabled");
+                }
+
+                // Webhook + WebChat are always available (passive channels)
+                channel_configs.insert(
+                    "webhook".to_string(),
+                    serde_json::json!({}),
+                );
+                channel_configs.insert(
+                    "webchat".to_string(),
+                    serde_json::json!({}),
+                );
+
+                if let Err(e) = state.registry.start_all(&state.cx.db, &channel_configs).await {
+                    eprintln!("  WARNING: Channel start error: {e}");
+                    eprintln!("  (server will still handle /v1/message requests)");
+                }
+            }
+
+            // ── Start the pipeline inbound loop (processes messages from channels) ──
+            if let Some(rx) = inbound_rx {
+                let pipeline_clone = std::sync::Arc::clone(&state.pipeline);
+                let db_clone = state.cx.db.clone();
+                let agent_clone = std::sync::Arc::new(crate::agent::orchestrator::Agent {
+                    db: state.cx.db.clone(),
+                    embed: state.cx.embed.clone(),
+                    hnsw: state.cx.hnsw.clone(),
+                    config: state.cx.config.clone(),
+                    llm: state.agent.llm.clone(),
+                    tools: crate::tools::builtin_registry(
+                        state.cx.db.clone(),
+                        state.cx.embed.clone(),
+                        state.cx.hnsw.clone(),
+                        state.cx.auto_link_tx.clone(),
+                        Some(state.agent.llm.clone()),
+                        state.cx.config.clone(),
+                    ),
+                    auto_link_tx: state.cx.auto_link_tx.clone(),
+                });
+                tokio::spawn(async move {
+                    pipeline_clone.run_inbound_loop(rx, db_clone, agent_clone).await;
+                });
+                println!("  Pipeline inbound loop: started");
             }
 
             let listener = tokio::net::TcpListener::bind(&addr)

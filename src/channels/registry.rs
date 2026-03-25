@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::db::Db;
-use crate::error::{CortexError, Result};
+use crate::error::Result;
 
 use super::types::{ChannelContext, ChannelHealth, InboundEnvelope};
 use super::Channel;
@@ -67,6 +67,9 @@ impl ChannelRegistry {
         channel_configs: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
         let channels = self.channels.read().await;
+        let mut started = 0usize;
+        let mut failed = 0usize;
+
         for (id, ch) in channels.iter() {
             let config = channel_configs
                 .get(id)
@@ -81,13 +84,19 @@ impl ChannelRegistry {
             };
 
             tracing::info!(channel = %id, "starting channel adapter");
-            if let Err(e) = ch.start(ctx).await {
-                tracing::error!(channel = %id, error = %e, "failed to start channel");
-                return Err(CortexError::Channel(format!(
-                    "Failed to start channel '{id}': {e}"
-                )));
+            match ch.start(ctx).await {
+                Ok(()) => {
+                    started += 1;
+                }
+                Err(e) => {
+                    // Log and skip — don't abort other channels
+                    tracing::warn!(channel = %id, error = %e, "channel failed to start (skipping)");
+                    failed += 1;
+                }
             }
         }
+
+        tracing::info!(started, failed, "channel startup complete");
         Ok(())
     }
 
