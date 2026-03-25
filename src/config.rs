@@ -23,6 +23,9 @@ pub struct Config {
     pub decay_lambda: f64,
     /// Number of HNSW neighbours to fetch for auto-link analysis.
     pub auto_link_candidates: usize,
+    /// Number of most-recent session nodes (UserInput + Fact) always included
+    /// in a chat turn's briefing, regardless of semantic similarity.
+    pub session_recency_window: usize,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             default_graph_depth: 2,
             decay_lambda: 0.01,
             auto_link_candidates: 20,
+            session_recency_window: 7,
         }
     }
 }

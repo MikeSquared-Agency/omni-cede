@@ -287,9 +287,42 @@ impl Agent {
         )
         .await?;
 
-        // 3. Build messages — just system + user, no history
+        // 3. Fetch recent session nodes (recency window) and merge any that
+        //    the semantic search didn't already return.
+        let recency_window = self.config.session_recency_window;
+        let briefed_ids: std::collections::HashSet<String> =
+            brief.nodes.iter().map(|sn| sn.node.id.clone()).collect();
+        let recent_nodes = self
+            .db
+            .call({
+                let sid = session_id.to_string();
+                move |conn| queries::get_recent_session_nodes(conn, &sid, recency_window)
+            })
+            .await?;
+        let mut recency_section = String::new();
+        // Reverse so we go chronological (oldest first) within the section
+        for node in recent_nodes.iter().rev() {
+            if briefed_ids.contains(&node.id) {
+                continue; // already in semantic briefing
+            }
+            let body = node.body.as_deref().unwrap_or(&node.title);
+            let label = match node.kind {
+                NodeKind::UserInput => "User",
+                _ => "Assistant",
+            };
+            recency_section.push_str(&format!("- {label}: {body}\n"));
+        }
+
+        let mut context_doc = brief.context_doc;
+        if !recency_section.is_empty() {
+            context_doc.push_str("## Session context (recent)\n");
+            context_doc.push_str(&recency_section);
+            context_doc.push('\n');
+        }
+
+        // 4. Build messages — just system + user, no history
         let mut messages = vec![
-            Message::system(brief.context_doc),
+            Message::system(context_doc),
             Message::user(input),
         ];
 

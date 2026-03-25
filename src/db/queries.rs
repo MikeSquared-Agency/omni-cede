@@ -602,6 +602,49 @@ pub fn get_all_edges(conn: &Connection) -> Result<Vec<Edge>> {
 
 // ─── Stats ──────────────────────────────────────────────
 
+/// Fetch the N most recent UserInput and Fact nodes linked to a session via
+/// PartOf or DerivesFrom edges, ordered newest-first.
+pub fn get_recent_session_nodes(
+    conn: &Connection,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.kind, n.title, n.body, n.importance, n.trust_score,
+                n.access_count, n.created_at, n.last_access, n.decay_rate, n.embedding
+         FROM nodes n
+         JOIN edges e ON e.src = n.id
+         WHERE e.dst = ?1
+           AND e.kind IN ('part_of', 'derives_from')
+           AND n.kind IN ('user_input', 'fact')
+         ORDER BY n.created_at DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+        let embedding_blob: Option<Vec<u8>> = row.get(10)?;
+        let embedding = embedding_blob.map(|b| blob_to_embedding(&b));
+        let kind_str: String = row.get(1)?;
+        Ok(Node {
+            id: row.get(0)?,
+            kind: NodeKind::from_str_opt(&kind_str).unwrap_or(NodeKind::Fact),
+            title: row.get(2)?,
+            body: row.get(3)?,
+            importance: row.get(4)?,
+            trust_score: row.get(5)?,
+            access_count: row.get(6)?,
+            created_at: row.get(7)?,
+            last_access: row.get(8)?,
+            decay_rate: row.get(9)?,
+            embedding,
+        })
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
 pub fn node_count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?)
 }
