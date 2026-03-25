@@ -140,10 +140,35 @@ pub async fn run() -> crate::error::Result<()> {
             };
 
             let api_key = std::env::var("API_KEY").ok();
+
+            // ── Build the omnichannel pipeline + registry ──
+            let registry = crate::channels::ChannelRegistry::new(1024);
+
+            // Register built-in channels
+            registry.register(std::sync::Arc::new(
+                crate::channels::webhook::WebhookChannel::new(),
+            )).await;
+            registry.register(std::sync::Arc::new(
+                crate::channels::telegram::TelegramChannel::new(),
+            )).await;
+            registry.register(std::sync::Arc::new(
+                crate::channels::discord::DiscordChannel::new(),
+            )).await;
+            registry.register(std::sync::Arc::new(
+                crate::channels::webchat::WebChatChannel::new(),
+            )).await;
+
+            let registry = std::sync::Arc::new(registry);
+            let pipeline = std::sync::Arc::new(
+                crate::channels::Pipeline::new(std::sync::Arc::clone(&registry)),
+            );
+
             let state = std::sync::Arc::new(crate::api::AppState {
                 cx,
                 agent,
                 api_key,
+                pipeline,
+                registry,
             });
 
             let app = crate::api::router(state);

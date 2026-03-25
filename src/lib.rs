@@ -13,6 +13,7 @@ pub mod cli;
 pub mod api;
 pub mod identity;
 pub mod session;
+pub mod channels;
 
 use std::collections::HashMap;
 use std::sync::Arc;

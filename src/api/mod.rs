@@ -3,6 +3,8 @@
 //! Provides a REST API that any messaging platform adapter can call:
 //!
 //! - `POST /v1/message`         — send a message (resolves identity, gets/creates session, runs turn)
+//! - `POST /v1/channels/webhook/inbound` — generic webhook inbound (pipeline-routed)
+//! - `GET  /v1/channels`        — list channels and their health
 //! - `GET  /v1/health`          — liveness check
 //! - `GET  /v1/sessions/:user_id` — list sessions for a user
 //! - `GET  /v1/stats`           — graph + session statistics
@@ -25,7 +27,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::agent::orchestrator::Agent;
-use crate::identity::{self, ChannelId};
+use crate::channels::pipeline::Pipeline;
+use crate::channels::types::InboundEnvelope;
+use crate::channels::registry::ChannelRegistry;
 use crate::session;
 use crate::CortexEmbedded;
 
@@ -36,6 +40,10 @@ pub struct AppState {
     pub cx: CortexEmbedded,
     pub agent: Agent,
     pub api_key: Option<String>,
+    /// The omnichannel pipeline (identity → session → hooks → agent → outbound).
+    pub pipeline: Arc<Pipeline>,
+    /// Channel registry for health/status queries.
+    pub registry: Arc<ChannelRegistry>,
 }
 
 // ─── Request / Response types ───────────────────────────
@@ -89,14 +97,39 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Webhook inbound request — superset of MessageRequest with optional fields.
+#[derive(Debug, Deserialize)]
+pub struct WebhookInboundRequest {
+    pub channel: Option<String>,
+    pub external_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub sender_name: Option<String>,
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChannelStatusResponse {
+    pub id: String,
+    pub health: crate::channels::types::ChannelHealth,
+}
+
 // ─── Router ─────────────────────────────────────────────
 
 /// Build the axum `Router` with all routes and middleware.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        // Core messaging endpoints
         .route("/v1/message", post(handle_message))
+        .route("/v1/channels/webhook/inbound", post(handle_webhook_inbound))
+        // Session / stats endpoints
         .route("/v1/sessions/{user_id}", get(handle_sessions))
         .route("/v1/stats", get(handle_stats))
+        // Channel management
+        .route("/v1/channels", get(handle_channels))
         // Auth middleware on all of the above
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         // Health endpoint is public (no auth)
@@ -141,65 +174,75 @@ async fn handle_health() -> Json<HealthResponse> {
     })
 }
 
+/// Original message handler — uses the pipeline for processing.
 async fn handle_message(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MessageRequest>,
 ) -> impl IntoResponse {
-    // 1. Resolve user identity
-    let channel_id = ChannelId::new(&req.channel, &req.external_id);
-    let user = match identity::resolve_user(&state.cx.db, channel_id).await {
-        Ok(u) => u,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Identity resolution failed: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
+    let envelope = InboundEnvelope::new(&req.channel, &req.external_id, &req.text);
 
-    // 2. Get or create session for this (user, channel) pair
-    let managed = match session::get_or_create(&state.cx.db, &user.id, &req.channel).await {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Session resolution failed: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
+    match state.pipeline.process_sync(envelope, &state.cx.db, &state.agent).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(MessageResponse {
+                reply: result.reply,
+                user_id: result.user_id,
+                session_id: result.session_id,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("{e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
 
-    // 3. Run agent turn
-    let reply = match state.agent.run_turn(&managed.node_id, &req.text).await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Agent error: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
+/// Webhook inbound — generic webhook channel messages.
+async fn handle_webhook_inbound(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<WebhookInboundRequest>,
+) -> impl IntoResponse {
+    let mut envelope = InboundEnvelope::new(
+        req.channel.as_deref().unwrap_or("webhook"),
+        &req.external_id,
+        &req.text,
+    );
+    envelope.sender_name = req.sender_name;
+    envelope.callback_url = req.callback_url;
+    envelope.group_id = req.group_id;
 
-    // 4. Record the turn
-    let _ = session::record_turn(&state.cx.db, &managed.node_id).await;
+    match state.pipeline.process(envelope, &state.cx.db, &state.agent).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(MessageResponse {
+                reply: result.reply,
+                user_id: result.user_id,
+                session_id: result.session_id,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("{e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
 
-    (
-        StatusCode::OK,
-        Json(MessageResponse {
-            reply,
-            user_id: user.id,
-            session_id: managed.node_id,
-        }),
-    )
-        .into_response()
+/// List all channels and their health status.
+async fn handle_channels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let health_list = state.registry.health_all().await;
+    let statuses: Vec<ChannelStatusResponse> = health_list
+        .into_iter()
+        .map(|(id, health)| ChannelStatusResponse { id, health })
+        .collect();
+    (StatusCode::OK, Json(statuses)).into_response()
 }
 
 async fn handle_sessions(
