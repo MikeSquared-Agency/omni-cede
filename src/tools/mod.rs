@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::process::Command as TokioCommand;
 use tokio::sync::RwLock;
 
 use crate::db::Db;
@@ -850,6 +851,166 @@ pub fn builtin_registry(
             })
         }),
     });
+
+    // ── bash: execute shell commands on the host ──
+    if config.bash_enabled {
+        let blocked = config.bash_blocked_patterns.clone();
+        let timeout_secs = config.bash_timeout_secs;
+        let max_output = config.bash_max_output_bytes;
+        reg.register(Tool {
+            name: "bash".to_string(),
+            description: concat!(
+                "Execute a shell command on the host machine and return its output. ",
+                "On Linux/macOS this runs via /bin/sh -c, on Windows via cmd /C. ",
+                "Use this for file operations, system inspection, running scripts, ",
+                "installing packages, managing services, or any task that requires ",
+                "interacting with the operating system. ",
+                "Commands have a timeout and dangerous operations are blocked. ",
+                "Always prefer single commands; for multi-step work, call bash multiple times."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Working directory for the command (optional, defaults to current dir)"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Override timeout in seconds (optional, max 300)"
+                    }
+                },
+                "required": ["command"]
+            }),
+            trust: 0.7,
+            handler: Arc::new(move |input| {
+                let blocked = blocked.clone();
+                let timeout_secs = timeout_secs;
+                let max_output = max_output;
+                Box::pin(async move {
+                    let command = input["command"].as_str().unwrap_or("").to_string();
+                    if command.is_empty() {
+                        return Ok(ToolResult {
+                            output: "Error: command is required.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Safety: check against blocked patterns
+                    let cmd_lower = command.to_lowercase();
+                    for pattern in &blocked {
+                        if cmd_lower.contains(&pattern.to_lowercase()) {
+                            return Ok(ToolResult {
+                                output: format!(
+                                    "Blocked: command matches safety pattern '{}'. This operation is not allowed.",
+                                    pattern
+                                ),
+                                success: false,
+                            });
+                        }
+                    }
+
+                    // Resolve timeout (user override capped at 300s)
+                    let timeout = std::time::Duration::from_secs(
+                        input["timeout_secs"]
+                            .as_u64()
+                            .unwrap_or(timeout_secs)
+                            .min(300),
+                    );
+
+                    // Build the OS-appropriate command
+                    let mut cmd = if cfg!(target_os = "windows") {
+                        let mut c = TokioCommand::new("cmd");
+                        c.args(["/C", &command]);
+                        c
+                    } else {
+                        let mut c = TokioCommand::new("/bin/sh");
+                        c.args(["-c", &command]);
+                        c
+                    };
+
+                    // Set working directory if provided
+                    if let Some(dir) = input["working_dir"].as_str() {
+                        cmd.current_dir(dir);
+                    }
+
+                    // Capture stdout + stderr
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::piped());
+
+                    // Spawn and await with timeout
+                    let child = cmd.spawn();
+                    let child = match child {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                output: format!("Failed to spawn command: {e}"),
+                                success: false,
+                            });
+                        }
+                    };
+
+                    let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+
+                    match result {
+                        Ok(Ok(output)) => {
+                            let code = output.status.code().unwrap_or(-1);
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+
+                            // Combine output, truncate if needed
+                            let mut combined = String::new();
+                            if !stdout.is_empty() {
+                                combined.push_str(&stdout);
+                            }
+                            if !stderr.is_empty() {
+                                if !combined.is_empty() {
+                                    combined.push_str("\n--- stderr ---\n");
+                                }
+                                combined.push_str(&stderr);
+                            }
+                            if combined.is_empty() {
+                                combined = "(no output)".into();
+                            }
+
+                            // Truncate to max_output bytes
+                            if combined.len() > max_output {
+                                combined.truncate(max_output);
+                                combined.push_str(&format!(
+                                    "\n... [truncated at {} bytes]",
+                                    max_output
+                                ));
+                            }
+
+                            let success = output.status.success();
+                            Ok(ToolResult {
+                                output: format!(
+                                    "[exit code: {}]\n{}",
+                                    code, combined
+                                ),
+                                success,
+                            })
+                        }
+                        Ok(Err(e)) => Ok(ToolResult {
+                            output: format!("Command execution error: {e}"),
+                            success: false,
+                        }),
+                        Err(_) => Ok(ToolResult {
+                            output: format!(
+                                "Command timed out after {} seconds and was killed.",
+                                timeout.as_secs()
+                            ),
+                            success: false,
+                        }),
+                    }
+                })
+            }),
+        });
+    }
 
     // ── delegate: spawn a sub-agent for a focused task ──
     if let Some(llm) = llm {

@@ -26,6 +26,14 @@ pub struct Config {
     /// Number of most-recent session nodes (UserInput + Fact) always included
     /// in a chat turn's briefing, regardless of semantic similarity.
     pub session_recency_window: usize,
+    /// Enable the bash/shell execution tool.
+    pub bash_enabled: bool,
+    /// Maximum seconds a bash command can run before being killed.
+    pub bash_timeout_secs: u64,
+    /// Maximum bytes of command output returned to the LLM.
+    pub bash_max_output_bytes: usize,
+    /// Shell command prefixes that are always blocked (case-insensitive substring match).
+    pub bash_blocked_patterns: Vec<String>,
 }
 
 impl Default for Config {
@@ -43,6 +51,20 @@ impl Default for Config {
             decay_lambda: 0.01,
             auto_link_candidates: 20,
             session_recency_window: 7,
+            bash_enabled: true,
+            bash_timeout_secs: 30,
+            bash_max_output_bytes: 10_000,
+            bash_blocked_patterns: vec![
+                "rm -rf /".into(),
+                "mkfs".into(),
+                "dd if=".into(),
+                ":(){:|:&};:".into(),
+                "shutdown".into(),
+                "reboot".into(),
+                "halt".into(),
+                "init 0".into(),
+                "init 6".into(),
+            ],
         }
     }
 }
