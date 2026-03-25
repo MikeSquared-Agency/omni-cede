@@ -6,10 +6,10 @@ mod graph_viz;
 mod graph_tui;
 
 #[derive(Parser)]
-#[command(name = "cede", about = "A forkable self-aware agent with graph memory")]
+#[command(name = "omni-cede", about = "Omnichannel self-aware agent with graph memory")]
 pub struct Cli {
     /// Path to the SQLite database file.
-    #[arg(long, default_value = "cede.db")]
+    #[arg(long, default_value = "omni-cede.db")]
     pub db: String,
 
     /// Use Ollama as the LLM backend (format: model@url, e.g. llama3@http://localhost:11434)
@@ -60,6 +60,16 @@ pub enum Commands {
     /// Check graph health
     Doctor,
 
+    /// Start the HTTP API server
+    Serve {
+        /// Host to bind to
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        /// Port to listen on
+        #[arg(long, default_value = "3000")]
+        port: u16,
+    },
+
     /// Pre-download the embedding model and initialize DB
     Init,
 }
@@ -109,6 +119,48 @@ pub async fn run() -> crate::error::Result<()> {
     let cx = crate::CortexEmbedded::open(&cli.db).await?;
 
     match cli.command {
+        Commands::Serve { host, port } => {
+            let llm = build_llm_client(&ollama_spec)?;
+            cx.set_llm(llm.clone()).await;
+            let agent = crate::agent::orchestrator::Agent {
+                db: cx.db.clone(),
+                embed: cx.embed.clone(),
+                hnsw: cx.hnsw.clone(),
+                config: cx.config.clone(),
+                llm: llm.clone(),
+                tools: crate::tools::builtin_registry(
+                    cx.db.clone(),
+                    cx.embed.clone(),
+                    cx.hnsw.clone(),
+                    cx.auto_link_tx.clone(),
+                    Some(llm),
+                    cx.config.clone(),
+                ),
+                auto_link_tx: cx.auto_link_tx.clone(),
+            };
+
+            let api_key = std::env::var("API_KEY").ok();
+            let state = std::sync::Arc::new(crate::api::AppState {
+                cx,
+                agent,
+                api_key,
+            });
+
+            let app = crate::api::router(state);
+            let addr = format!("{host}:{port}");
+            println!("omni-cede API server listening on {addr}");
+            if std::env::var("API_KEY").is_err() {
+                println!("  WARNING: API_KEY not set — auth disabled (dev mode)");
+            }
+
+            let listener = tokio::net::TcpListener::bind(&addr)
+                .await
+                .map_err(|e| crate::error::CortexError::Config(format!("bind failed: {e}")))?;
+            axum::serve(listener, app)
+                .await
+                .map_err(|e| crate::error::CortexError::Config(format!("server error: {e}")))?;
+            Ok(())
+        }
         Commands::Init => {
             println!("Database initialized at: {}", cli.db);
             println!("Embedding model ready.");
@@ -465,7 +517,7 @@ pub async fn run() -> crate::error::Result<()> {
                 })
                 .await?;
 
-            println!("cede chat — type 'exit' or Ctrl+C to quit\n");
+            println!("omni-cede chat — type 'exit' or Ctrl+C to quit\n");
             let stdin = io::stdin();
             loop {
                 print!("> ");

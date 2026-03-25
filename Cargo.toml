@@ -1,16 +1,16 @@
 [package]
-name    = "cede"
+name    = "omni-cede"
 version = "0.1.0"
 edition = "2021"
-description = "A forkable self-aware agent with graph memory. Built on cortex-embedded."
+description = "Omnichannel self-aware agent. Fork of cede with HTTP API, identity, and session management."
 
 [lib]
-name = "cede"
+name = "omni_cede"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cede"
-path = "src/bin/cede.rs"
+name = "omni-cede"
+path = "src/bin/omni_cede.rs"
 
 [dependencies]
 rusqlite         = { version = "0.31", features = ["bundled"] }
@@ -31,3 +31,7 @@ async-trait      = "0.1"
 chrono           = "0.4"
 ratatui          = "0.29"
 crossterm        = { version = "0.28", features = ["event-stream"] }
+axum             = "0.8"
+tower-http       = { version = "0.6", features = ["cors", "trace"] }
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

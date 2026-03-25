@@ -10,6 +10,9 @@ pub mod tools;
 pub mod llm;
 pub mod agent;
 pub mod cli;
+pub mod api;
+pub mod identity;
+pub mod session;
 
 use std::collections::HashMap;
 use std::sync::Arc;
