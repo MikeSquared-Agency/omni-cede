@@ -1,162 +1,234 @@
-# cortex-embedded
+# omni-cede
 
-**One crate. One SQLite file. A complete AI agent with graph memory, sub-agents, and a CLI.**
+**Omnichannel self-aware agent. One API, every channel, one memory graph.**
 
-Everything — identity, knowledge, tool calls, LLM calls, sub-agent work, loop iterations, self-model — is a node in the graph. The agent queries its own history the same way it queries any other knowledge.
+omni-cede extends [cede](https://github.com/MikeSquared-Agency/cede) with an HTTP API, identity resolution, and per-channel session management. Connect WhatsApp, Telegram, Slack, Discord, or any custom integration — the agent remembers across all of them.
 
-## Features
+## Ecosystem
 
-- **Graph memory** — 18 node kinds, 6 edge kinds, full provenance tracking
-- **Hybrid recall** — HNSW ANN search + BFS graph traversal + trust scoring + recency decay
-- **Embeddings** — BAAI/bge-small-en-v1.5 via fastembed (384-dim, runs locally)
-- **Auto-link** — background task creates `RelatesTo` and `Contradicts` edges automatically
-- **Decay** — importance fades over time; Soul/Belief/Goal nodes are immune
-- **Trust propagation** — `Supports` edges boost trust, `Contradicts` edges reduce it
-- **Context compaction** — LLM extracts key facts from long conversations into the graph
-- **LLM backends** — Anthropic Claude, Ollama (local), Mock (testing)
-- **Tool registry** — tools write provenance-tracked results into the graph
-- **Sub-agents** — spawn into the shared graph with scoped identity
-- **CLI** — chat, ask, memory search, identity management, consolidation, diagnostics
+```
+cortex-embedded          <-- the engine (upstream)
+  |-- cede               <-- forkable starter kit
+       |-- omni-cede     <-- you are here (omnichannel deployment)
+```
+
+## What omni-cede Adds
+
+On top of everything in cede (graph memory, hybrid recall, auto-linking, decay, tools, sub-agents, TUI), omni-cede adds:
+
+| Layer | What it does |
+|-------|-------------|
+| **HTTP API** | `POST /v1/message` — send a message from any channel and get a reply |
+| **Identity** | Maps `(channel, external_id)` pairs to internal user IDs. Same person on WhatsApp and Telegram = same user |
+| **Sessions** | One active session per (user, channel). WhatsApp gets its own conversational flow; Telegram gets another. Semantic recall searches the global graph — cross-channel knowledge |
+| **Auth** | `x-api-key` header middleware. Set `API_KEY` env var to enable; omit for dev mode |
 
 ## Quick Start
 
 ```bash
+# Clone
+git clone https://github.com/MikeSquared-Agency/omni-cede.git
+cd omni-cede
+
 # Build
 cargo build --release
 
-# Initialize database and download embedding model
-cortex init
+# Start the API server
+ANTHROPIC_API_KEY=sk-ant-... omni-cede serve
+# Custom host/port
+omni-cede serve --host 127.0.0.1 --port 8080
+# With Ollama
+omni-cede --ollama llama3 serve
 
-# Check graph health
-cortex doctor
+# Send a message
+curl -X POST http://localhost:3000/v1/message \
+  -H "Content-Type: application/json" \
+  -d '{"channel": "whatsapp", "external_id": "+447123456789", "text": "Hello!"}'
 
-# View identity
-cortex soul show
+# Health check
+curl http://localhost:3000/v1/health
 
-# Memory stats
-cortex memory stats
+# List sessions for a user
+curl http://localhost:3000/v1/sessions/<user_id>
 
-# Interactive chat (requires LLM)
-ANTHROPIC_API_KEY=sk-ant-... cortex chat
-# or with Ollama
-cortex --ollama llama3 chat
-
-# Single query
-cortex ask "What do you know about JWT tokens?"
-
-# Semantic search
-cortex memory search "authentication"
-
-# Run trust consolidation
-cortex consolidate
+# Stats
+curl http://localhost:3000/v1/stats
 ```
+
+### With Auth
+
+```bash
+# Start with auth enabled
+API_KEY=my-secret-key ANTHROPIC_API_KEY=sk-ant-... omni-cede serve
+
+# Requests require the header
+curl -X POST http://localhost:3000/v1/message \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: my-secret-key" \
+  -d '{"channel": "telegram", "external_id": "12345678", "text": "Hello!"}'
+```
+
+## API Reference
+
+### `POST /v1/message`
+
+Send a message from any channel. The server resolves the user's identity, gets or creates a session, runs the agent, and returns the reply.
+
+**Request:**
+```json
+{
+  "channel": "whatsapp",
+  "external_id": "+447123456789",
+  "text": "What did we discuss yesterday?"
+}
+```
+
+**Response:**
+```json
+{
+  "reply": "Yesterday we discussed the new API design...",
+  "user_id": "a1b2c3d4-...",
+  "session_id": "e5f6g7h8-..."
+}
+```
+
+### `GET /v1/health`
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0"
+}
+```
+
+### `GET /v1/sessions/:user_id`
+
+```json
+[
+  {
+    "session_id": "e5f6g7h8-...",
+    "channel": "whatsapp",
+    "created_at": 1711324800,
+    "turn_count": 42,
+    "last_active": 1711411200
+  }
+]
+```
+
+### `GET /v1/stats`
+
+```json
+{
+  "nodes": 1234,
+  "edges": 5678,
+  "by_kind": {"fact": 200, "soul": 1, "session": 15, "...": "..."},
+  "managed_sessions": 15,
+  "total_turns": 342
+}
+```
+
+## How Identity Works
+
+```
+WhatsApp +447123456789  -+
+                          |-> user_id: a1b2c3d4
+Telegram @johndoe       -+    (linked via identity layer)
+```
+
+When a message arrives, the identity layer:
+1. Looks up `(channel, external_id)` in the `channel_mappings` table
+2. If found, returns the existing internal user
+3. If not, creates a new user and mapping
+
+You can link multiple channels to one user via the identity API.
+
+## How Sessions Work
+
+Each (user, channel) pair gets its own session. This means:
+
+- **Recency window is channel-scoped** — "stop using big words" on WhatsApp only affects WhatsApp's briefing
+- **Semantic recall is global** — facts learned on Telegram are available when the user asks on WhatsApp
+- **Sessions persist** — reconnecting to the same channel resumes the same session
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                cortex-embedded               │
-├──────────┬──────────┬──────────┬────────────┤
-│  recall  │ briefing │  tools   │   agent    │
-│ (hybrid  │ (context │ (registry│  (loop +   │
-│  search) │  doc)    │  + trust)│ sub-agents)│
-├──────────┴──────────┴──────────┴────────────┤
-│              graph + memory                  │
-│         (BFS walk, scoring, decay)           │
-├──────────┬──────────────────────────────────┤
-│   HNSW   │           SQLite                  │
-│ (2-tier) │  (WAL mode, bundled rusqlite)     │
-├──────────┴──────────────────────────────────┤
-│              fastembed                        │
-│        (BAAI/bge-small-en-v1.5)              │
-└─────────────────────────────────────────────┘
++---------------------------------------------+
+|                 omni-cede                    |
++-----------+-----------+---------------------+
+|  HTTP API |  Identity |  Session Manager    |
+| (axum)    | (channel  | (one per user +     |
+|           |  mapping) |  channel pair)      |
++-----------+-----------+---------------------+
+|                  cede core                   |
++---------+----------+---------+--------------+
+|  recall | briefing |  tools  |    agent     |
+| (HNSW + | (scored  | (custom |  (loop +    |
+|  graph) |  context)|  + std) |  subagent)  |
++---------+----------+---------+--------------+
+|            graph + memory                    |
+|       (BFS, scoring, decay)                  |
++---------+------------------------------------+
+|  HNSW   |         SQLite                     |
+| (2-tier)|  (WAL, bundled rusqlite)           |
++---------+------------------------------------+
+|            fastembed                          |
+|      (BAAI/bge-small-en-v1.5)                |
++----------------------------------------------+
 ```
 
-### Node Kinds
+## CLI Commands
 
-| Category | Kinds |
-|----------|-------|
-| Knowledge | `Fact`, `Entity`, `Concept`, `Decision` |
-| Identity | `Soul`, `Belief`, `Goal` |
-| Operational | `Session`, `Turn`, `LlmCall`, `ToolCall`, `LoopIteration` |
-| Sub-agents | `SubAgent`, `Delegation`, `Synthesis` |
-| Meta | `Pattern`, `Capability`, `Limitation`, `Contradiction` |
+omni-cede retains all of cede's CLI commands and adds `serve`:
 
-### Edge Kinds
-
-`RelatesTo` · `Contradicts` · `Supports` · `DerivesFrom` · `PartOf` · `Supersedes`
-
-## How It Works
-
-Every interaction creates a provenance chain:
-
-```
-Fact → ToolCall → LoopIteration → Session
+```bash
+omni-cede serve                    # Start HTTP API server (0.0.0.0:3000)
+omni-cede serve --port 8080        # Custom port
+omni-cede chat                     # Interactive CLI chat
+omni-cede ask "question"           # Single query
+omni-cede graph explore            # TUI graph explorer
+omni-cede graph overview           # Graph visualization
+omni-cede memory stats             # Memory statistics
+omni-cede memory search "query"    # Semantic search
+omni-cede soul show                # View identity
+omni-cede doctor                   # Health check
+omni-cede consolidate              # Trust propagation
+omni-cede init                     # Initialize DB + download model
 ```
 
-The agent knows not just *what* it knows, but *how it came to know it*, *when*, *via which tool*, and *how much to trust it*.
+## Environment Variables
 
-**Recall pipeline:**
-1. Embed query → HNSW k-NN search
-2. BFS graph walk from candidates
-3. Score: `importance × trust × recency × proximity_bonus`
-4. Return ranked nodes with contradiction warnings
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ANTHROPIC_API_KEY` | Yes* | Anthropic API key (*or use `--ollama`) |
+| `ANTHROPIC_MODEL` | No | Model override (default: `claude-sonnet-4-20250514`) |
+| `API_KEY` | No | If set, requires `x-api-key` header on all requests |
+| `RUST_LOG` | No | Tracing filter (default: `omni_cede=info,tower_http=info`) |
 
-**Background tasks:**
-- **Auto-link** — new nodes are compared against the graph; similar nodes get `RelatesTo` edges, contradicting nodes get `Contradicts` edges
-- **Decay** — every 60s, nodes not accessed in 24h lose importance (floor: 0.01)
+## Staying Updated
 
-## Using as a Library
+omni-cede tracks cede as `upstream`. To pull improvements:
 
-```rust
-use cortex_embedded::{CortexEmbedded, types::*};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cx = CortexEmbedded::open("my_agent.db").await?;
-
-    // Store knowledge
-    let node = Node::new(NodeKind::Fact, "Rust is fast")
-        .with_body("Rust provides zero-cost abstractions and memory safety.");
-    cx.remember(node).await?;
-
-    // Recall
-    let results = cx.recall("performance", RecallOptions::default()).await?;
-    for r in &results {
-        println!("[{}] {} — score: {:.3}", r.node.kind, r.node.title, r.score);
-    }
-
-    // Build briefing for LLM
-    let briefing = cx.briefing("system design", 12).await?;
-    println!("{}", briefing.context_doc);
-
-    Ok(())
-}
+```bash
+git fetch upstream
+git merge upstream/master
 ```
 
 ## Dependencies
 
+Everything from cede, plus:
+
 | Crate | Purpose |
 |-------|---------|
-| `rusqlite` (bundled) | SQLite with WAL mode |
-| `instant-distance` | HNSW approximate nearest neighbor search |
-| `fastembed` | Local text embeddings (ONNX runtime) |
-| `tokio` | Async runtime |
-| `reqwest` | HTTP client for Anthropic API |
-| `clap` | CLI argument parsing |
-| `async-channel` | Background task communication |
+| `axum` 0.8 | HTTP framework |
+| `tower-http` 0.6 | CORS + request tracing middleware |
+| `tracing` + `tracing-subscriber` | Structured logging |
 
 ## Tests
 
 ```bash
-# Run all tests (22 total)
+# Run all 28 tests
 cargo test -- --test-threads=1
-
-# Just HNSW unit tests
-cargo test --lib hnsw
-
-# Just integration tests
-cargo test --test integration -- --test-threads=1
 ```
 
 ## License
