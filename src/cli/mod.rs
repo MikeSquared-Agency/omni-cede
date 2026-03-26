@@ -135,7 +135,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.auto_link_tx.clone(),
                     Some(llm),
                     cx.config.clone(),
-                ),
+                ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
 
@@ -245,7 +245,7 @@ pub async fn run() -> crate::error::Result<()> {
                         state.cx.auto_link_tx.clone(),
                         Some(state.agent.llm.clone()),
                         state.cx.config.clone(),
-                    ),
+                    ).await,
                     auto_link_tx: state.cx.auto_link_tx.clone(),
                 });
                 tokio::spawn(async move {
@@ -407,7 +407,7 @@ pub async fn run() -> crate::error::Result<()> {
                                 cx.auto_link_tx.clone(),
                                 Some(llm),
                                 cx.config.clone(),
-                            ),
+                            ).await,
                             auto_link_tx: cx.auto_link_tx.clone(),
                         };
 
@@ -620,7 +620,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.auto_link_tx.clone(),
                     Some(llm),
                     cx.config.clone(),
-                ),
+                ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
 
@@ -671,7 +671,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.auto_link_tx.clone(),
                     Some(llm),
                     cx.config.clone(),
-                ),
+                ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
 
