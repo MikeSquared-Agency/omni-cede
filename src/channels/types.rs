@@ -206,7 +206,7 @@ pub struct PipelineResult {
 
 // ─── Helpers ────────────────────────────────────────────
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

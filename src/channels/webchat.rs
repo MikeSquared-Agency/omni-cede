@@ -137,6 +137,11 @@ impl WebChatChannel {
     pub fn can_accept(&self) -> bool {
         self.active_connections.load(Ordering::Relaxed) < self.max_connections
     }
+
+    /// Get the max connections limit.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
 }
 
 #[async_trait]

@@ -227,7 +227,7 @@ Everything from cede, plus:
 ## Tests
 
 ```bash
-# Run all 28 tests
+# Run all 22 tests
 cargo test -- --test-threads=1
 ```
 
