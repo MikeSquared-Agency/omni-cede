@@ -233,6 +233,23 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
             ));
         }
         doc.push('\n');
+    } else {
+        // Bootstrap prompt — no identity exists yet.  Rather than
+        // prescribing a personality, nudge the agent to discover who it
+        // is through conversation with the user, then persist what it
+        // learns via the `remember` tool. Once Soul/Belief/Goal nodes
+        // exist with embeddings this fallback stops appearing.
+        doc.push_str("## First contact\n");
+        doc.push_str("You have no memory yet — this is a blank slate.\n\n");
+        doc.push_str("Start by finding out who you're talking to: ask their name, what they need from you, and what role they want you to play. ");
+        doc.push_str("Let the conversation shape who you become.\n\n");
+        doc.push_str("You have a `remember` tool that stores things permanently in your memory graph. ");
+        doc.push_str("As you learn about yourself and the people you talk to, use it to build your own identity:\n");
+        doc.push_str("- `Soul` — who you are, your name, your nature\n");
+        doc.push_str("- `Belief` — values and principles you adopt\n");
+        doc.push_str("- `Goal` — what you're working towards\n");
+        doc.push_str("- `Fact` / `Entity` — things you learn about the world and people\n\n");
+        doc.push_str("Don't invent a persona. Let it emerge from what you're told and what you observe.\n\n");
     }
 
     // What you know
