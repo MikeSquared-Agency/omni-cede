@@ -8,15 +8,18 @@
 //! - `GET  /v1/health`          — liveness check
 //! - `GET  /v1/sessions/:user_id` — list sessions for a user
 //! - `GET  /v1/stats`           — graph + session statistics
+//! - `GET  /v1/ws/chat`         — WebSocket chat endpoint
 //!
 //! Authentication is via an `x-api-key` header checked against the `API_KEY` env var.
 //! If `API_KEY` is not set, authentication is disabled (development mode).
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State, ws::{WebSocket, WebSocketUpgrade, Message as WsMessage}},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -29,6 +32,7 @@ use tower_http::trace::TraceLayer;
 use crate::agent::orchestrator::Agent;
 use crate::channels::pipeline::Pipeline;
 use crate::channels::types::InboundEnvelope;
+use crate::channels::webchat::{WsChatMessage, WsChatReply};
 use crate::channels::registry::ChannelRegistry;
 use crate::session;
 use crate::CortexEmbedded;
@@ -44,6 +48,10 @@ pub struct AppState {
     pub pipeline: Arc<Pipeline>,
     /// Channel registry for health/status queries.
     pub registry: Arc<ChannelRegistry>,
+    /// WebChat active connection counter (shared with WebChatChannel).
+    pub webchat_counter: Arc<AtomicUsize>,
+    /// WebChat maximum concurrent connections.
+    pub webchat_max: usize,
 }
 
 // ─── Request / Response types ───────────────────────────
@@ -132,8 +140,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/channels", get(handle_channels))
         // Auth middleware on all of the above
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        // Health endpoint is public (no auth)
+        // Public endpoints (auth via query param for WS)
         .route("/v1/health", get(handle_health))
+        .route("/v1/ws/chat", get(handle_ws_upgrade))
         // Cross-cutting middleware
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -311,4 +320,123 @@ async fn handle_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }),
     )
         .into_response()
+}
+
+// ─── WebSocket chat ────────────────────────────────────
+
+async fn handle_ws_upgrade(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    // Auth check: if API_KEY is set, verify ?api_key= query param
+    if let Some(ref expected) = state.api_key {
+        match params.get("api_key") {
+            Some(k) if k == expected => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "Invalid or missing api_key query parameter".into(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Check connection limit
+    let current = state.webchat_counter.load(Ordering::Relaxed);
+    if current >= state.webchat_max {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("WebChat connection limit reached ({}/{})", current, state.webchat_max),
+            }),
+        )
+            .into_response();
+    }
+
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+        .into_response()
+}
+
+async fn handle_ws_connection(socket: WebSocket, state: Arc<AppState>) {
+    use futures::stream::StreamExt;
+    use futures::sink::SinkExt;
+
+    let (mut sender, mut receiver) = socket.split();
+    let session_token = uuid::Uuid::new_v4().to_string();
+
+    // Increment connection counter
+    state.webchat_counter.fetch_add(1, Ordering::Relaxed);
+
+    // Send connected message
+    let connected = WsChatReply::connected(&session_token);
+    if let Ok(json) = serde_json::to_string(&connected) {
+        let _ = sender.send(WsMessage::Text(json.into())).await;
+    }
+
+    tracing::info!(session_token = %session_token, "webchat client connected");
+
+    // Process messages
+    while let Some(Ok(msg)) = receiver.next().await {
+        let text = match msg {
+            WsMessage::Text(t) => t.to_string(),
+            WsMessage::Close(_) => break,
+            _ => continue,
+        };
+
+        // Parse the client message
+        let chat_msg: WsChatMessage = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = WsChatReply::error(&format!("Invalid message format: {e}"));
+                if let Ok(json) = serde_json::to_string(&err) {
+                    let _ = sender.send(WsMessage::Text(json.into())).await;
+                }
+                continue;
+            }
+        };
+
+        // Send typing indicator
+        let typing = WsChatReply::typing();
+        if let Ok(json) = serde_json::to_string(&typing) {
+            let _ = sender.send(WsMessage::Text(json.into())).await;
+        }
+
+        // Use session_token from message or from connection
+        let token = chat_msg
+            .session_token
+            .as_deref()
+            .unwrap_or(&session_token);
+
+        // Create inbound envelope and process through pipeline
+        let envelope = InboundEnvelope::new("webchat", token, &chat_msg.text);
+
+        match state
+            .pipeline
+            .process_sync(envelope, &state.cx.db, &state.agent)
+            .await
+        {
+            Ok(result) => {
+                let reply = WsChatReply::reply(&result.reply);
+                if let Ok(json) = serde_json::to_string(&reply) {
+                    if sender.send(WsMessage::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                let err = WsChatReply::error(&format!("Agent error: {e}"));
+                if let Ok(json) = serde_json::to_string(&err) {
+                    let _ = sender.send(WsMessage::Text(json.into())).await;
+                }
+            }
+        }
+    }
+
+    // Decrement connection counter
+    state.webchat_counter.fetch_sub(1, Ordering::Relaxed);
+    tracing::info!(session_token = %session_token, "webchat client disconnected");
 }

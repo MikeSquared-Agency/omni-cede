@@ -64,6 +64,9 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| CortexError::Tool(format!("unknown tool: {name}")))?;
 
+        // Validate input against schema before executing
+        self.validate_input(name, &input)?;
+
         let trust = tool.trust;
         let result = (tool.handler)(input.clone()).await?;
 
@@ -111,6 +114,30 @@ impl ToolRegistry {
         }
 
         Ok(result)
+    }
+
+    /// Validate tool input against its JSON schema.
+    pub fn validate_input(&self, name: &str, input: &serde_json::Value) -> Result<()> {
+        let tool = self
+            .get(name)
+            .ok_or_else(|| CortexError::Tool(format!("unknown tool: {name}")))?;
+
+        // Skip validation for tools with no meaningful schema
+        if tool.input_schema.is_null() || tool.input_schema.as_object().is_none() {
+            return Ok(());
+        }
+
+        let validator = jsonschema::validator_for(&tool.input_schema).map_err(|e| {
+            CortexError::Tool(format!("invalid schema for tool '{name}': {e}"))
+        })?;
+
+        if let Err(e) = validator.validate(&input) {
+            return Err(CortexError::Tool(format!(
+                "Input validation failed for tool '{name}': {e}"
+            )));
+        }
+
+        Ok(())
     }
 
     /// Get a cloneable handler function for a tool (for parallel execution).

@@ -244,12 +244,9 @@ impl OllamaClient {
             model,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl LlmClient for OllamaClient {
-    async fn complete(&self, messages: &[Message]) -> Result<LlmResponse> {
-        let msgs: Vec<serde_json::Value> = messages
+    fn build_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+        messages
             .iter()
             .map(|m| {
                 serde_json::json!({
@@ -257,19 +254,15 @@ impl LlmClient for OllamaClient {
                         Role::System => "system",
                         Role::User => "user",
                         Role::Assistant => "assistant",
-                        Role::Tool => "user",
+                        Role::Tool => "tool",
                     },
                     "content": m.content,
                 })
             })
-            .collect();
+            .collect()
+    }
 
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": msgs,
-            "stream": false,
-        });
-
+    async fn do_request(&self, body: serde_json::Value) -> Result<LlmResponse> {
         let resp = self
             .client
             .post(format!("{}/api/chat", self.url))
@@ -288,17 +281,81 @@ impl LlmClient for OllamaClient {
             .unwrap_or("")
             .to_string();
 
+        // Parse tool calls from Ollama response
+        let mut tool_calls = Vec::new();
+        let mut tool_name = None;
+        let mut tool_input = None;
+        let mut tool_use_id = None;
+
+        if let Some(calls) = json["message"]["tool_calls"].as_array() {
+            for (i, call) in calls.iter().enumerate() {
+                let name = call["function"]["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let arguments = call["function"]["arguments"].clone();
+                let id = format!("ollama_tc_{i}");
+
+                if tool_name.is_none() {
+                    tool_name = Some(name.clone());
+                    tool_input = Some(arguments.clone());
+                    tool_use_id = Some(id.clone());
+                }
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    input: arguments,
+                });
+            }
+        }
+
+        let stop_reason = if tool_calls.is_empty() {
+            StopReason::EndTurn
+        } else {
+            StopReason::ToolUse
+        };
+
         Ok(LlmResponse {
             text,
-            stop_reason: StopReason::EndTurn,
-            tool_name: None,
-            tool_input: None,
-            tool_use_id: None,
-            tool_calls: Vec::new(),
+            stop_reason,
+            tool_name,
+            tool_input,
+            tool_use_id,
+            tool_calls,
             raw_content: None,
             input_tokens: 0,
             output_tokens: 0,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for OllamaClient {
+    async fn complete(&self, messages: &[Message]) -> Result<LlmResponse> {
+        let msgs = Self::build_messages(messages);
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": msgs,
+            "stream": false,
+        });
+        self.do_request(body).await
+    }
+
+    async fn complete_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[serde_json::Value],
+    ) -> Result<LlmResponse> {
+        let msgs = Self::build_messages(messages);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": msgs,
+            "stream": false,
+        });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools.to_vec());
+        }
+        self.do_request(body).await
     }
 
     fn model_name(&self) -> &str {

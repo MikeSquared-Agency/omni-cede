@@ -148,9 +148,10 @@ pub async fn run() -> crate::error::Result<()> {
             registry.register(std::sync::Arc::new(
                 crate::channels::webhook::WebhookChannel::new(),
             )).await;
-            registry.register(std::sync::Arc::new(
-                crate::channels::webchat::WebChatChannel::new(),
-            )).await;
+            let webchat = crate::channels::webchat::WebChatChannel::new();
+            let webchat_counter = webchat.connection_counter();
+            let webchat_max = webchat.max_connections();
+            registry.register(std::sync::Arc::new(webchat)).await;
 
             // Register active channels only if their tokens are configured
             if std::env::var("TELEGRAM_BOT_TOKEN").is_ok() {
@@ -178,6 +179,8 @@ pub async fn run() -> crate::error::Result<()> {
                 api_key,
                 pipeline,
                 registry,
+                webchat_counter,
+                webchat_max,
             });
 
             let app = crate::api::router(state.clone());
@@ -341,7 +344,17 @@ pub async fn run() -> crate::error::Result<()> {
                 Ok(())
             }
             SoulAction::Edit => {
-                println!("Soul editing not yet implemented. Use `cede memory show <id>` to inspect.");
+                // Launch the graph TUI filtered to Identity nodes with edit mode.
+                // Select an identity node and press 'e' to edit.
+                // Identity category is index 1 in ALL_CATEGORIES
+                graph_tui::run_with_edit(
+                    cx.db.clone(),
+                    cx.embed.clone(),
+                    cx.hnsw.clone(),
+                    1, // "Identity" category
+                )
+                    .await
+                    .map_err(|e| crate::error::CortexError::Config(format!("TUI error: {e}")))?;
                 Ok(())
             }
         },
@@ -408,7 +421,13 @@ pub async fn run() -> crate::error::Result<()> {
                             })
                             .await?;
 
-                        graph_tui::run_with_chat(cx.db.clone(), agent, session_id)
+                        graph_tui::run_with_chat(
+                            cx.db.clone(),
+                            agent,
+                            session_id,
+                            Some(cx.embed.clone()),
+                            Some(cx.hnsw.clone()),
+                        )
                             .await
                             .map_err(|e| crate::error::CortexError::Config(format!("TUI error: {e}")))?;
                     }

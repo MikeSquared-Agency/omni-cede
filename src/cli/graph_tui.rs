@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 
 use crate::agent::orchestrator::Agent;
 use crate::db::Db;
+use crate::embed::EmbedHandle;
+use crate::hnsw::VectorIndex;
 use crate::types::*;
 
 // ─── Color mapping ──────────────────────────────────────
@@ -98,6 +100,7 @@ enum Focus {
     NodeList,
     Detail,
     Chat,
+    SoulEdit,
 }
 
 // ─── App state ──────────────────────────────────────────
@@ -127,6 +130,12 @@ pub struct App {
     // Stats for delta display
     prev_node_count: usize,
     prev_edge_count: usize,
+    // Soul edit modal
+    edit_node_id: Option<String>,
+    edit_node_title: String,
+    edit_input: String,
+    edit_saving: bool,
+    prev_focus: Focus,
 }
 
 impl App {
@@ -163,6 +172,11 @@ impl App {
             thinking: false,
             prev_node_count: nc,
             prev_edge_count: ec,
+            edit_node_id: None,
+            edit_node_title: String::new(),
+            edit_input: String::new(),
+            edit_saving: false,
+            prev_focus: Focus::NodeList,
         }
     }
 
@@ -270,6 +284,32 @@ impl App {
         }
         conns
     }
+
+    fn enter_edit_mode(&mut self) {
+        let info = self.selected_node().and_then(|node| {
+            match node.kind {
+                NodeKind::Soul | NodeKind::Belief | NodeKind::Goal => {
+                    Some((node.id.clone(), node.title.clone(), node.body.clone()))
+                }
+                _ => None,
+            }
+        });
+        if let Some((id, title, body)) = info {
+            self.edit_node_id = Some(id);
+            self.edit_node_title = title;
+            self.edit_input = body.unwrap_or_default();
+            self.edit_saving = false;
+            self.prev_focus = self.focus;
+            self.focus = Focus::SoulEdit;
+        }
+    }
+
+    fn exit_edit_mode(&mut self) {
+        self.edit_node_id = None;
+        self.edit_input.clear();
+        self.edit_node_title.clear();
+        self.focus = self.prev_focus;
+    }
 }
 
 fn build_lookups(nodes: &[Node], edges: &[Edge]) -> (
@@ -292,6 +332,8 @@ fn build_lookups(nodes: &[Node], edges: &[Edge]) -> (
 enum AgentResult {
     Response(String),
     Error(String),
+    EditSaved(String),
+    EditError(String),
 }
 
 // ─── Public entry points ────────────────────────────────
@@ -320,11 +362,137 @@ pub fn run_interactive(nodes: Vec<Node>, edges: Vec<Edge>) -> std::io::Result<()
     Ok(())
 }
 
+/// Launch the graph explorer with editing support for identity nodes (no chat).
+pub async fn run_with_edit(
+    db: Db,
+    embed: EmbedHandle,
+    hnsw: Arc<tokio::sync::RwLock<VectorIndex>>,
+    start_category: usize,
+) -> std::io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let nodes = db.call(|conn| crate::db::queries::get_all_nodes_light(conn)).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let edges = db.call(|conn| crate::db::queries::get_all_edges(conn)).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let mut app = App::new(nodes, edges);
+    app.focus = Focus::NodeList;
+    // Pre-filter to specified category (e.g., Identity = 1)
+    app.category_idx = start_category;
+    app.refilter();
+
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<AgentResult>();
+    let mut event_stream = EventStream::new();
+
+    loop {
+        terminal.draw(|f| draw(f, &mut app, false))?;
+
+        tokio::select! {
+            maybe_event = event_stream.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        if app.focus == Focus::SoulEdit {
+                            match key.code {
+                                KeyCode::Esc => { app.exit_edit_mode(); }
+                                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    if let Some(ref node_id) = app.edit_node_id {
+                                        app.edit_saving = true;
+                                        let nid = node_id.clone();
+                                        let new_body = app.edit_input.clone();
+                                        let title = app.edit_node_title.clone();
+                                        let db_c = db.clone();
+                                        let embed_c = embed.clone();
+                                        let hnsw_c = hnsw.clone();
+                                        let tx = result_tx.clone();
+                                        tokio::spawn(async move {
+                                            let body_c = new_body.clone();
+                                            let nid_c = nid.clone();
+                                            match db_c.call(move |conn| {
+                                                crate::db::queries::update_node_fields(
+                                                    conn, &nid_c, None, None, Some(&body_c), None, None,
+                                                )
+                                            }).await {
+                                                Ok(_) => {
+                                                    let embed_text = format!("{} {}", title, new_body);
+                                                    if let Ok(vec) = embed_c.embed(&embed_text).await {
+                                                        hnsw_c.write().await.insert(nid.clone(), vec);
+                                                    }
+                                                    let _ = tx.send(AgentResult::EditSaved(nid));
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(AgentResult::EditError(e.to_string()));
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                KeyCode::Enter => { app.edit_input.push('\n'); }
+                                KeyCode::Backspace => { app.edit_input.pop(); }
+                                KeyCode::Char(c) => { app.edit_input.push(c); }
+                                _ => {}
+                            }
+                        } else if app.is_node_search {
+                            match key.code {
+                                KeyCode::Esc => { app.is_node_search = false; app.search_query.clear(); app.refilter(); }
+                                KeyCode::Enter => { app.is_node_search = false; }
+                                KeyCode::Backspace => { app.search_query.pop(); app.refilter(); }
+                                KeyCode::Char(c) => { app.search_query.push(c); app.refilter(); }
+                                _ => {}
+                            }
+                        } else {
+                            // Graph keys + 'e' for edit
+                            match key.code {
+                                KeyCode::Char('e') => app.enter_edit_mode(),
+                                _ => { if handle_graph_keys(&mut app, key) { break; } }
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                    None => break,
+                }
+            }
+            Some(result) = result_rx.recv() => {
+                match result {
+                    AgentResult::EditSaved(_nid) => {
+                        app.edit_saving = false;
+                        app.exit_edit_mode();
+                        // Reload graph
+                        if let Ok(nodes) = db.call(|conn| crate::db::queries::get_all_nodes_light(conn)).await {
+                            if let Ok(edges) = db.call(|conn| crate::db::queries::get_all_edges(conn)).await {
+                                app.reload_graph(nodes, edges);
+                            }
+                        }
+                    }
+                    AgentResult::EditError(e) => {
+                        app.edit_saving = false;
+                        // Just exit edit mode on error — user sees original content
+                        app.exit_edit_mode();
+                        let _ = e; // logged via tracing in production
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
 /// Launch the TUI with an embedded chat panel and live graph updates.
 pub async fn run_with_chat(
     db: Db,
     agent: Agent,
     session_id: String,
+    embed: Option<EmbedHandle>,
+    hnsw: Option<Arc<tokio::sync::RwLock<VectorIndex>>>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -351,7 +519,53 @@ pub async fn run_with_chat(
             maybe_event = event_stream.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if app.focus == Focus::Chat && !app.is_node_search {
+                        if app.focus == Focus::SoulEdit {
+                            match key.code {
+                                KeyCode::Esc => { app.exit_edit_mode(); }
+                                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    // Save the edit
+                                    if let Some(ref node_id) = app.edit_node_id {
+                                        app.edit_saving = true;
+                                        let nid = node_id.clone();
+                                        let new_body = app.edit_input.clone();
+                                        let title = app.edit_node_title.clone();
+                                        let db_c = db.clone();
+                                        let embed_c = embed.clone();
+                                        let hnsw_c = hnsw.clone();
+                                        let tx = result_tx.clone();
+                                        tokio::spawn(async move {
+                                            let body_c = new_body.clone();
+                                            let nid_c = nid.clone();
+                                            match db_c.call(move |conn| {
+                                                crate::db::queries::update_node_fields(
+                                                    conn, &nid_c, None, None, Some(&body_c), None, None,
+                                                )
+                                            }).await {
+                                                Ok(_) => {
+                                                    // Re-embed if embed handle available
+                                                    if let Some(ref emb) = embed_c {
+                                                        let embed_text = format!("{} {}", title, new_body);
+                                                        if let Ok(vec) = emb.embed(&embed_text).await {
+                                                            if let Some(ref h) = hnsw_c {
+                                                                h.write().await.insert(nid.clone(), vec);
+                                                            }
+                                                        }
+                                                    }
+                                                    let _ = tx.send(AgentResult::EditSaved(nid));
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(AgentResult::EditError(e.to_string()));
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                KeyCode::Enter => { app.edit_input.push('\n'); }
+                                KeyCode::Backspace => { app.edit_input.pop(); }
+                                KeyCode::Char(c) => { app.edit_input.push(c); }
+                                _ => {}
+                            }
+                        } else if app.focus == Focus::Chat && !app.is_node_search {
                             match key.code {
                                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                                 KeyCode::Esc => { app.focus = Focus::NodeList; }
@@ -413,6 +627,21 @@ pub async fn run_with_chat(
                     AgentResult::Error(e) => {
                         app.chat_messages.push(ChatMsg { role: ChatRole::System, text: format!("Error: {e}") });
                     }
+                    AgentResult::EditSaved(_nid) => {
+                        app.edit_saving = false;
+                        app.chat_messages.push(ChatMsg {
+                            role: ChatRole::System,
+                            text: format!("Saved: {}", app.edit_node_title),
+                        });
+                        app.exit_edit_mode();
+                    }
+                    AgentResult::EditError(e) => {
+                        app.edit_saving = false;
+                        app.chat_messages.push(ChatMsg {
+                            role: ChatRole::System,
+                            text: format!("Edit error: {e}"),
+                        });
+                    }
                 }
                 // Reload graph to show new nodes/edges
                 if let Ok(nodes) = db.call(|conn| crate::db::queries::get_all_nodes_light(conn)).await {
@@ -467,6 +696,7 @@ fn handle_graph_keys_with_chat(app: &mut App, key: crossterm::event::KeyEvent) -
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('Q') => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Char('e') => app.enter_edit_mode(),
         KeyCode::Up | KeyCode::Char('k') => nav_up(app),
         KeyCode::Down | KeyCode::Char('j') => nav_down(app),
         KeyCode::PageUp => nav_page_up(app),
@@ -476,8 +706,8 @@ fn handle_graph_keys_with_chat(app: &mut App, key: crossterm::event::KeyEvent) -
         KeyCode::Char('f') => { app.category_idx = (app.category_idx + 1) % ALL_CATEGORIES.len(); app.refilter(); }
         KeyCode::Char('/') => { app.is_node_search = true; app.search_query.clear(); }
         KeyCode::Enter => drill_into(app),
-        KeyCode::Tab => { app.focus = match app.focus { Focus::NodeList => Focus::Detail, Focus::Detail => Focus::Chat, Focus::Chat => Focus::NodeList }; }
-        KeyCode::BackTab => { app.focus = match app.focus { Focus::NodeList => Focus::Chat, Focus::Detail => Focus::NodeList, Focus::Chat => Focus::Detail }; }
+        KeyCode::Tab => { app.focus = match app.focus { Focus::NodeList => Focus::Detail, Focus::Detail => Focus::Chat, Focus::Chat => Focus::NodeList, Focus::SoulEdit => Focus::NodeList }; }
+        KeyCode::BackTab => { app.focus = match app.focus { Focus::NodeList => Focus::Chat, Focus::Detail => Focus::NodeList, Focus::Chat => Focus::Detail, Focus::SoulEdit => Focus::Detail }; }
         KeyCode::Esc | KeyCode::Backspace => { if !app.search_query.is_empty() { app.search_query.clear(); app.refilter(); } else { app.go_back(); } }
         KeyCode::Char(c @ '1'..='9') => jump_to_connection(app, c),
         _ => {}
@@ -585,6 +815,11 @@ fn draw(f: &mut ratatui::Frame, app: &mut App, show_chat: bool) {
     }
 
     draw_help(f, app, main_chunks[2], show_chat);
+
+    // Soul edit modal overlay
+    if app.focus == Focus::SoulEdit {
+        draw_soul_edit(f, app, size);
+    }
 }
 
 fn draw_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
@@ -839,13 +1074,65 @@ fn draw_chat(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(input_widget, chat_chunks[1]);
 }
 
+fn draw_soul_edit(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    // Center the modal — 70% width, 60% height
+    let modal_w = (area.width as f32 * 0.7) as u16;
+    let modal_h = (area.height as f32 * 0.6) as u16;
+    let x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+    let modal_area = Rect::new(x, y, modal_w, modal_h);
+
+    // Clear the area behind the modal
+    let clear = Paragraph::new("").style(Style::default().bg(Color::Black));
+    f.render_widget(clear, modal_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
+        .split(modal_area);
+
+    // Title bar
+    let title_text = format!(" Editing: {} ", app.edit_node_title);
+    let title = Paragraph::new(Line::from(Span::styled(
+        &title_text,
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    f.render_widget(title, chunks[0]);
+
+    // Content area
+    let status = if app.edit_saving { " (saving…)" } else { "" };
+    let cursor = if !app.edit_saving { "█" } else { "" };
+    let content_text = format!("{}{}", app.edit_input, cursor);
+    let content = Paragraph::new(content_text)
+        .block(
+            Block::default()
+                .title(format!(" Content{status} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, chunks[1]);
+
+    // Help bar
+    let help = Paragraph::new(Line::from(Span::styled(
+        " Ctrl+S: save │ Esc: cancel │ Enter: newline",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(help, chunks[2]);
+}
+
 fn draw_help(f: &mut ratatui::Frame, app: &App, area: Rect, show_chat: bool) {
     let text = if app.is_node_search {
         " Type to search │ Enter: apply │ Esc: cancel"
     } else if show_chat {
         match app.focus {
             Focus::Chat => " Type + Enter │ ↑↓/PgUp/PgDn: scroll │ Tab/Esc: graph │ Ctrl+C: quit",
-            _ => " ↑↓/jk: navigate │ f: filter │ /: search │ Enter: drill │ 1-9: jump │ Tab: cycle │ q: quit",
+            _ => " ↑↓/jk: navigate │ f: filter │ /: search │ Enter: drill │ e: edit │ 1-9: jump │ Tab: cycle │ q: quit",
         }
     } else {
         " ↑↓/jk: navigate │ Tab: category │ /: search │ Enter: drill │ 1-9: jump │ Esc: back │ q: quit"

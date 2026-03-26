@@ -15,6 +15,7 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
@@ -23,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{CortexError, Result};
 
 use super::types::*;
+use super::types::now_unix;
 use super::Channel;
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
@@ -87,6 +89,14 @@ struct DiscordUser {
     bot: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DmChannel {
+    id: String,
+    #[serde(rename = "type")]
+    channel_type: u8,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateMessage {
     content: String,
@@ -132,43 +142,133 @@ impl Channel for DiscordChannel {
 
         self.started.store(true, Ordering::SeqCst);
 
-        // Start a polling loop for DM channels.
-        // NOTE: For production, this should use the Discord Gateway (WebSocket).
-        // This polling approach is for development/testing without serenity.
+        // Parse bot's own user ID so we can filter self-messages
+        let me: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CortexError::Channel(format!("Discord parse @me: {e}")))?;
+        let bot_id = me["id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // Parse optional guild channel IDs to poll from DISCORD_CHANNELS env
+        let extra_channels: Vec<String> = std::env::var("DISCORD_CHANNELS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Start the DM + channel polling loop
         let client = self.client.clone();
-        let _inbound_tx = ctx.inbound_tx.clone();
+        let inbound_tx = ctx.inbound_tx.clone();
         let mut shutdown = ctx.shutdown.clone();
         let mut cancel_rx = self.cancel.subscribe();
         let token_clone = token.clone();
 
         tokio::spawn(async move {
             tracing::info!(
-                "discord adapter started (REST polling — for production, enable serenity gateway)"
+                "discord adapter started (REST polling for DMs{})",
+                if extra_channels.is_empty() {
+                    String::new()
+                } else {
+                    format!(" + {} guild channels", extra_channels.len())
+                }
             );
 
-            // In REST-only mode, we rely on the HTTP API to receive messages
-            // (similar to webhook mode). The gateway WebSocket implementation
-            // would be enabled with the `discord` feature flag using serenity.
-            //
-            // For now, we just keep the task alive to maintain health status.
+            // Track last seen message ID per channel to avoid re-processing
+            let mut last_seen: HashMap<String, String> = HashMap::new();
+
             loop {
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     _ = cancel_rx.changed() => break,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        // Heartbeat — verify token is still valid
-                        let url = format!("{}/users/@me", DISCORD_API);
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        // Collect channel IDs to poll: DM channels + configured guild channels
+                        let mut channels_to_poll: Vec<String> = extra_channels.clone();
+
+                        // Fetch DM channels
+                        let dm_url = format!("{}/users/@me/channels", DISCORD_API);
                         match client
-                            .get(&url)
+                            .get(&dm_url)
                             .header("Authorization", format!("Bot {}", token_clone))
                             .send()
                             .await
                         {
                             Ok(r) if r.status().is_success() => {
-                                tracing::trace!("discord heartbeat OK");
+                                if let Ok(dms) = r.json::<Vec<DmChannel>>().await {
+                                    for dm in dms {
+                                        // type 1 = DM channel
+                                        if dm.channel_type == 1 {
+                                            channels_to_poll.push(dm.id);
+                                        }
+                                    }
+                                }
                             }
-                            _ => {
-                                tracing::warn!("discord heartbeat failed");
+                            Ok(r) => {
+                                tracing::warn!(status = %r.status(), "discord: failed to list DM channels");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "discord: DM channel list request failed");
+                                continue;
+                            }
+                        }
+
+                        // Poll each channel for new messages
+                        for chan_id in &channels_to_poll {
+                            let mut url = format!(
+                                "{}/channels/{}/messages?limit=50",
+                                DISCORD_API, chan_id
+                            );
+                            if let Some(after) = last_seen.get(chan_id) {
+                                url = format!("{}&after={}", url, after);
+                            }
+
+                            let msgs = match client
+                                .get(&url)
+                                .header("Authorization", format!("Bot {}", token_clone))
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    r.json::<Vec<DiscordMessage>>().await.unwrap_or_default()
+                                }
+                                _ => continue,
+                            };
+
+                            // Messages come newest-first; process oldest-first
+                            for msg in msgs.iter().rev() {
+                                // Skip bot messages (including self)
+                                if msg.author.bot || msg.author.id == bot_id {
+                                    continue;
+                                }
+                                // Skip empty messages
+                                if msg.content.trim().is_empty() {
+                                    continue;
+                                }
+
+                                let envelope = InboundEnvelope {
+                                    channel: "discord".into(),
+                                    external_id: msg.author.id.clone(),
+                                    sender_name: Some(msg.author.username.clone()),
+                                    text: msg.content.clone(),
+                                    media: None,
+                                    reply_to: None,
+                                    group_id: Some(msg.channel_id.clone()),
+                                    callback_url: None,
+                                    raw: serde_json::Value::Null,
+                                    timestamp: now_unix(),
+                                };
+
+                                if let Err(e) = inbound_tx.send(envelope).await {
+                                    tracing::error!(error = %e, "discord: failed to send to pipeline");
+                                }
+                            }
+
+                            // Update last_seen to newest message
+                            if let Some(newest) = msgs.first() {
+                                last_seen.insert(chan_id.clone(), newest.id.clone());
                             }
                         }
                     }
