@@ -33,6 +33,7 @@ fn kind_color(kind: NodeKind) -> Color {
         | NodeKind::ToolCall | NodeKind::LoopIteration => Color::Yellow,
         NodeKind::Pattern | NodeKind::Limitation | NodeKind::Capability => Color::Green,
         NodeKind::BackgroundTask => Color::Blue,
+        NodeKind::CronJob | NodeKind::CronExecution | NodeKind::Skill => Color::LightBlue,
     }
 }
 
@@ -75,6 +76,8 @@ fn node_category(kind: NodeKind) -> &'static str {
         | NodeKind::ToolCall | NodeKind::LoopIteration => "Operational",
         NodeKind::Pattern | NodeKind::Limitation | NodeKind::Capability => "Self-Model",
         NodeKind::BackgroundTask => "Tasks",
+        NodeKind::CronJob | NodeKind::CronExecution => "Scheduler",
+        NodeKind::Skill => "Skills",
     }
 }
 

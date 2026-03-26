@@ -14,6 +14,9 @@ pub mod api;
 pub mod identity;
 pub mod session;
 pub mod channels;
+pub mod scheduler;
+#[cfg(feature = "browser")]
+pub mod browser;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -236,7 +239,7 @@ impl CortexEmbedded {
     fn start_background_tasks(
         &self,
         auto_link_rx: async_channel::Receiver<NodeId>,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         // Auto-link task
         let db = self.db.clone();
@@ -260,6 +263,7 @@ impl CortexEmbedded {
         let db = self.db.clone();
         let interval = std::time::Duration::from_secs(self.config.decay_interval_secs);
         let decay_interval_secs = self.config.decay_interval_secs;
+        let mut shutdown_rx3 = shutdown_rx.clone();
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -269,10 +273,34 @@ impl CortexEmbedded {
                     _ = ticker.tick() => {
                         let _ = run_decay(&db, decay_interval_secs).await;
                     }
-                    _ = shutdown_rx.changed() => break,
+                    _ = shutdown_rx3.changed() => break,
                 }
             }
         });
+
+        // Cron scheduler task
+        {
+            let db = self.db.clone();
+            let embed = self.embed.clone();
+            let hnsw = self.hnsw.clone();
+            let auto_link_tx = self.auto_link_tx.clone();
+            let llm = self.llm.clone();
+            let config = self.config.clone();
+
+            tokio::spawn(async move {
+                scheduler::run(
+                    db,
+                    embed,
+                    hnsw,
+                    auto_link_tx,
+                    llm,
+                    config,
+                    shutdown_rx,
+                    30, // check every 30 seconds
+                )
+                .await;
+            });
+        }
     }
 }
 

@@ -37,3 +37,14 @@ tower-http       = { version = "0.6", features = ["cors", "trace"] }
 tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml             = "0.8"
+cron             = "0.13"
+url              = "2"
+
+# Browser module (optional)
+tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
+base64           = { version = "0.22", optional = true }
+rand             = { version = "0.8", optional = true }
+
+[features]
+default = []
+browser = ["tokio-tungstenite", "base64", "rand"]

@@ -30,6 +30,11 @@ pub enum NodeKind {
     LoopIteration,
     // Background tasks
     BackgroundTask,
+    // Scheduled tasks
+    CronJob,
+    CronExecution,
+    // Dynamic skills / plugins
+    Skill,
     // Self-model — medium decay
     Pattern,
     Limitation,
@@ -53,6 +58,9 @@ impl NodeKind {
             Self::ToolCall => "tool_call",
             Self::LoopIteration => "loop_iteration",
             Self::BackgroundTask => "background_task",
+            Self::CronJob => "cron_job",
+            Self::CronExecution => "cron_execution",
+            Self::Skill => "skill",
             Self::Pattern => "pattern",
             Self::Limitation => "limitation",
             Self::Capability => "capability",
@@ -75,6 +83,9 @@ impl NodeKind {
             "tool_call" => Some(Self::ToolCall),
             "loop_iteration" => Some(Self::LoopIteration),
             "background_task" => Some(Self::BackgroundTask),
+            "cron_job" => Some(Self::CronJob),
+            "cron_execution" => Some(Self::CronExecution),
+            "skill" => Some(Self::Skill),
             "pattern" => Some(Self::Pattern),
             "limitation" => Some(Self::Limitation),
             "capability" => Some(Self::Capability),
@@ -89,6 +100,10 @@ impl NodeKind {
             Self::Soul | Self::Belief | Self::Goal => 0.0,
             // User inputs decay moderately (they're conversation context)
             Self::UserInput => 0.02,
+            // Cron definitions persist like identity
+            Self::CronJob | Self::Skill => 0.0,
+            // Cron executions decay fast like operational nodes
+            Self::CronExecution => 0.05,
             // Operational nodes decay fast
             Self::Session | Self::Turn | Self::LlmCall
             | Self::ToolCall | Self::LoopIteration => 0.05,
@@ -103,7 +118,9 @@ impl NodeKind {
     pub fn default_importance(&self) -> f64 {
         match self {
             Self::Soul | Self::Belief | Self::Goal => 1.0,
+            Self::CronJob | Self::Skill => 0.8,
             Self::UserInput => 0.4,
+            Self::CronExecution => 0.2,
             Self::Session | Self::Turn | Self::LlmCall
             | Self::ToolCall | Self::LoopIteration => 0.2,
             _ => 0.5,
