@@ -135,7 +135,28 @@ async fn deliver_for_session(
         callback_url: None,
     };
 
-    // 2. Build a brief prompt with the notification summaries
+    // 2. Build a brief prompt with the notification summaries + persona
+    //    Pull Soul + Belief nodes so the LLM reply stays in character.
+    let persona = db
+        .call(|conn| {
+            let mut parts = Vec::new();
+            let souls = queries::get_nodes_by_kind(conn, NodeKind::Soul)?;
+            for n in &souls {
+                if let Some(ref b) = n.body {
+                    parts.push(b.clone());
+                }
+            }
+            let beliefs = queries::get_nodes_by_kind(conn, NodeKind::Belief)?;
+            for n in &beliefs {
+                if let Some(ref b) = n.body {
+                    parts.push(format!("Belief: {}", b));
+                }
+            }
+            Ok(parts.join("\n"))
+        })
+        .await
+        .unwrap_or_default();
+
     let mut notification_block = String::new();
     let mut delivered_ids: Vec<String> = Vec::new();
     for node in notifications {
@@ -145,14 +166,21 @@ async fn deliver_for_session(
         delivered_ids.push(node.id.clone());
     }
 
+    let persona_section = if persona.is_empty() {
+        String::new()
+    } else {
+        format!("## Your identity\n{}\n\n", persona)
+    };
+
     let system_prompt = format!(
-        "You are following up on background work you kicked off earlier. \
-         The following tasks have completed:\n\n{}\n\
+        "{persona_section}\
+         You are following up on background work you kicked off earlier. \
+         The following tasks have completed:\n\n{notification_block}\n\
          Write a brief, natural message to let the user know what happened. \
          Be conversational and concise — this is a proactive update, not a \
          formal report. If something failed, mention it clearly but calmly. \
-         Do NOT say \"notification\" or refer to yourself as a system.",
-        notification_block,
+         Do NOT say \"notification\" or refer to yourself as a system. \
+         Stay in character.",
     );
 
     let messages = vec![
