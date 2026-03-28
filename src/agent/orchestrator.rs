@@ -403,8 +403,8 @@ impl Agent {
                 _ => "Assistant",
             };
             let ts = format_timestamp(node.created_at);
-            let rel = memory::relative_time(node.created_at);
-            recency_section.push_str(&format!("- [{ts}] ({rel}) {label}: {body}\n"));
+            let meta = memory::node_metadata_label(node);
+            recency_section.push_str(&format!("- [{ts}] ({meta}) {label}: {body}\n"));
         }
 
         let mut context_doc = brief.context_doc;

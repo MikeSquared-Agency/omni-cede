@@ -199,8 +199,8 @@ async fn deliver_for_session(
                 _ => "Assistant",
             };
             let ts = memory::format_timestamp(node.created_at);
-            let rel = memory::relative_time(node.created_at);
-            recency_section.push_str(&format!("- [{ts}] ({rel}) {label}: {body}\n"));
+            let meta = memory::node_metadata_label(node);
+            recency_section.push_str(&format!("- [{ts}] ({meta}) {label}: {body}\n"));
         }
         context_doc.push_str("## Session context (recent)\n");
         context_doc.push_str(&recency_section);

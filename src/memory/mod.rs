@@ -62,6 +62,27 @@ pub fn relative_time(unix: i64) -> String {
     }
 }
 
+/// Build a compact metadata label for a node, exposing all fields the LLM
+/// might need to reason about timing, confidence, and relevance.
+pub fn node_metadata_label(node: &crate::types::Node) -> String {
+    let created = relative_time(node.created_at);
+    let last_access = match node.last_access {
+        Some(la) => relative_time(la),
+        None => "never".to_string(),
+    };
+    format!(
+        "kind: {}, created: {}, last accessed: {}, access count: {}, \
+         importance: {:.2}, trust: {:.2}, decay rate: {:.3}",
+        node.kind,
+        created,
+        last_access,
+        node.access_count,
+        node.importance,
+        node.trust_score,
+        node.decay_rate,
+    )
+}
+
 // ─── recall ─────────────────────────────────────────────
 
 /// Hybrid semantic + graph search.
@@ -287,10 +308,10 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
         doc.push_str("## Who you are\n");
         for s in &identity {
             let body = s.node.body.as_deref().unwrap_or("");
-            let rel = relative_time(s.node.created_at);
+            let meta = node_metadata_label(&s.node);
             doc.push_str(&format!(
-                "- **{}**: {} _(remembered {})_\n",
-                s.node.title, body, rel
+                "- **{}**: {} _({})_\n",
+                s.node.title, body, meta
             ));
         }
         doc.push('\n');
@@ -329,15 +350,15 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
         doc.push_str("## What you know\n");
         for s in &knowledge {
             let body = s.node.body.as_deref().unwrap_or("");
-            let rel = relative_time(s.node.created_at);
+            let meta = node_metadata_label(&s.node);
             let confidence = if s.node.trust_score < 0.5 {
                 " *(uncertain — may need verification)*"
             } else {
                 ""
             };
             doc.push_str(&format!(
-                "- **{}**{} _(remembered {})_\n  {}\n",
-                s.node.title, confidence, rel, body
+                "- **{}**{} _({})_\n  {}\n",
+                s.node.title, confidence, meta, body
             ));
         }
         doc.push('\n');
@@ -352,10 +373,10 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
         doc.push_str("## Recent conversation\n");
         for s in &conversation {
             let body = s.node.body.as_deref().unwrap_or(&s.node.title);
-            let rel = relative_time(s.node.created_at);
+            let meta = node_metadata_label(&s.node);
             doc.push_str(&format!(
                 "- ({}) User said: {}\n",
-                rel, body
+                meta, body
             ));
         }
         doc.push('\n');
