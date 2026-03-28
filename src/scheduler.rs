@@ -34,6 +34,12 @@ pub struct CronJobMeta {
     /// Unix timestamp of the last successful fire (0 = never).
     #[serde(default)]
     pub last_fired: i64,
+    /// The user who created this job (for routing results back).
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// The channel from which this job was created.
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 fn default_max_iter() -> usize { 5 }
@@ -178,6 +184,8 @@ async fn tick(
             node.title.clone(),
             meta.task.clone(),
             meta.max_iterations,
+            meta.user_id.clone(),
+            meta.channel.clone(),
         );
     }
 
@@ -196,6 +204,8 @@ fn fire_cron_job(
     job_title: String,
     task: String,
     max_iterations: usize,
+    user_id: Option<String>,
+    channel: Option<String>,
 ) {
     tokio::spawn(async move {
         // 1. Create a CronExecution node
@@ -269,6 +279,55 @@ fn fire_cron_job(
             .await;
 
         let _ = auto_link_tx.try_send(fact_id);
+
+        // Create a Notification in the user's session so it gets delivered
+        // to the right channel by the notification delivery loop.
+        if let (Some(ref uid), Some(ref ch)) = (&user_id, &channel) {
+            let uid2 = uid.clone();
+            let ch2 = ch.clone();
+            let session_id: Option<String> = db
+                .call(move |conn| {
+                    crate::session::create_tables(conn)?;
+                    let mut stmt = conn.prepare(
+                        "SELECT node_id FROM managed_sessions WHERE user_id = ?1 AND channel = ?2",
+                    )?;
+                    let rows: Vec<String> = stmt
+                        .query_map(rusqlite::params![uid2, ch2], |row| row.get(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(rows.into_iter().next())
+                })
+                .await
+                .ok()
+                .flatten();
+
+            if let Some(sid) = session_id {
+                let notif = Node::new(
+                    NodeKind::Notification,
+                    format!(
+                        "[{}] Scheduled task completed: {job_title}",
+                        format_timestamp(crate::types::now_unix())
+                    ),
+                )
+                .with_body(&result_body);
+                let notif_id = notif.id.clone();
+                let _ = db
+                    .call({
+                        let n = notif;
+                        move |conn| queries::insert_node(conn, &n)
+                    })
+                    .await;
+                let notif_edge = Edge::new(notif_id, sid, EdgeKind::PartOf);
+                let _ = db
+                    .call(move |conn| queries::insert_edge(conn, &notif_edge))
+                    .await;
+                tracing::info!(
+                    user_id = %uid.as_str(),
+                    channel = %ch.as_str(),
+                    "created notification for cron result in user session"
+                );
+            }
+        }
 
         // Update execution node body
         let eid = exec_id;

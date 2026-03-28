@@ -1340,12 +1340,34 @@ pub fn builtin_registry_core(
                         });
                     }
 
+                    // Look up the active user's session to tag the cron job
+                    // with owner info so results route back to the right channel.
+                    let session_owner: Option<(String, String)> = {
+                        let db2 = db.clone();
+                        db2.call(|conn| {
+                            crate::session::create_tables(conn)?;
+                            let mut stmt = conn.prepare(
+                                "SELECT user_id, channel FROM managed_sessions ORDER BY last_active DESC LIMIT 1",
+                            )?;
+                            let rows: Vec<(String, String)> = stmt
+                                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                                .filter_map(|r| r.ok())
+                                .collect();
+                            Ok(rows.into_iter().next())
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    };
+
                     let meta = crate::scheduler::CronJobMeta {
                         cron: cron_expr.clone(),
                         task: task.clone(),
                         max_iterations: max_iter,
                         enabled: true,
                         last_fired: 0,
+                        user_id: session_owner.as_ref().map(|(u, _)| u.clone()),
+                        channel: session_owner.as_ref().map(|(_, c)| c.clone()),
                     };
 
                     let node = Node {
