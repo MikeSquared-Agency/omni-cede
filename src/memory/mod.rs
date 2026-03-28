@@ -12,6 +12,56 @@ use crate::types::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Format a unix timestamp as a human-readable datetime string.
+pub fn format_timestamp(unix: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dt = UNIX_EPOCH + Duration::from_secs(unix as u64);
+    // Format as ISO-like: YYYY-MM-DD HH:MM:SS UTC
+    let secs_since_epoch = dt.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let days = secs_since_epoch / 86400;
+    let time_of_day = secs_since_epoch % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    // Simple date calculation from days since epoch
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02} UTC")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days_since_epoch + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Format a relative time description (e.g., "2 hours ago", "3 days ago").
+pub fn relative_time(unix: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let diff = now - unix;
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{} min ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{} hours ago", diff / 3600)
+    } else {
+        format!("{} days ago", diff / 86400)
+    }
+}
+
 // ─── recall ─────────────────────────────────────────────
 
 /// Hybrid semantic + graph search.
@@ -215,8 +265,18 @@ pub async fn briefing_with_kinds(
 }
 
 /// Render the briefing as a markdown document for the LLM system prompt.
+///
+/// Written in natural language — no raw IDs, numeric scores, or kind tags
+/// so the agent's responses stay human-friendly.
 fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]) -> String {
     let mut doc = String::new();
+
+    // Current time header — so the agent always knows what time it is
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    doc.push_str(&format!("## Current time\n{}\n\n", format_timestamp(now_unix)));
 
     // Who you are
     let identity: Vec<&ScoredNode> = nodes
@@ -227,28 +287,25 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
         doc.push_str("## Who you are\n");
         for s in &identity {
             let body = s.node.body.as_deref().unwrap_or("");
+            let rel = relative_time(s.node.created_at);
             doc.push_str(&format!(
-                "- **[{}]** {}: {}\n",
-                s.node.kind, s.node.title, body
+                "- **{}**: {} _(remembered {})_\n",
+                s.node.title, body, rel
             ));
         }
         doc.push('\n');
     } else {
-        // Bootstrap prompt — no identity exists yet.  Rather than
-        // prescribing a personality, nudge the agent to discover who it
-        // is through conversation with the user, then persist what it
-        // learns via the `remember` tool. Once Soul/Belief/Goal nodes
-        // exist with embeddings this fallback stops appearing.
+        // Bootstrap prompt — no identity exists yet.
         doc.push_str("## First contact\n");
         doc.push_str("You have no memory yet — this is a blank slate.\n\n");
         doc.push_str("Start by finding out who you're talking to: ask their name, what they need from you, and what role they want you to play. ");
         doc.push_str("Let the conversation shape who you become.\n\n");
-        doc.push_str("You have a `remember` tool that stores things permanently in your memory graph. ");
+        doc.push_str("You have a `remember` tool that stores things permanently in your memory. ");
         doc.push_str("As you learn about yourself and the people you talk to, use it to build your own identity:\n");
-        doc.push_str("- `Soul` — who you are, your name, your nature\n");
-        doc.push_str("- `Belief` — values and principles you adopt\n");
-        doc.push_str("- `Goal` — what you're working towards\n");
-        doc.push_str("- `Fact` / `Entity` — things you learn about the world and people\n\n");
+        doc.push_str("- Your name and nature\n");
+        doc.push_str("- Values and principles you adopt\n");
+        doc.push_str("- What you're working towards\n");
+        doc.push_str("- Things you learn about the world and people\n\n");
         doc.push_str("Don't invent a persona. Let it emerge from what you're told and what you observe.\n\n");
     }
 
@@ -272,14 +329,15 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
         doc.push_str("## What you know\n");
         for s in &knowledge {
             let body = s.node.body.as_deref().unwrap_or("");
-            let trust_flag = if s.node.trust_score < 0.5 {
-                " ⚠ LOW TRUST"
+            let rel = relative_time(s.node.created_at);
+            let confidence = if s.node.trust_score < 0.5 {
+                " *(uncertain — may need verification)*"
             } else {
                 ""
             };
             doc.push_str(&format!(
-                "- **[{}]** {} (trust: {:.2}, score: {:.3}){}\n  {}\n",
-                s.node.kind, s.node.title, s.node.trust_score, s.score, trust_flag, body
+                "- **{}**{} _(remembered {})_\n  {}\n",
+                s.node.title, confidence, rel, body
             ));
         }
         doc.push('\n');
@@ -294,39 +352,43 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
         doc.push_str("## Recent conversation\n");
         for s in &conversation {
             let body = s.node.body.as_deref().unwrap_or(&s.node.title);
+            let rel = relative_time(s.node.created_at);
             doc.push_str(&format!(
-                "- User said (score: {:.3}): {}\n",
-                s.score, body
+                "- ({}) User said: {}\n",
+                rel, body
             ));
         }
         doc.push('\n');
     }
 
-    // Active contradictions
+    // Active contradictions — described by title, not raw IDs
     if !contradictions.is_empty() {
-        doc.push_str("## Active contradictions\n");
+        doc.push_str("## Conflicting information\n");
+        doc.push_str("You have memories that contradict each other. Consider asking the user to clarify:\n");
         for c in contradictions {
+            // We show the short IDs as a fallback but they'll be overridden
+            // when the caller has node titles available. For now, keep it
+            // minimally technical.
+            let a_label = &c.node_a[..8.min(c.node_a.len())];
+            let b_label = &c.node_b[..8.min(c.node_b.len())];
             doc.push_str(&format!(
-                "- CONFLICT: node {} ↔ node {} (unresolved)\n",
-                &c.node_a[..8.min(c.node_a.len())],
-                &c.node_b[..8.min(c.node_b.len())],
+                "- Memory {} conflicts with memory {} (unresolved)\n",
+                a_label, b_label,
             ));
         }
         doc.push('\n');
     }
 
-    // What to verify
+    // What to verify — items with low trust
     let stale_or_untrusted: Vec<&ScoredNode> = nodes
         .iter()
         .filter(|s| s.node.trust_score < 0.5)
         .collect();
     if !stale_or_untrusted.is_empty() {
-        doc.push_str("## What to verify\n");
+        doc.push_str("## Needs verification\n");
+        doc.push_str("These memories may be outdated or unreliable:\n");
         for s in &stale_or_untrusted {
-            doc.push_str(&format!(
-                "- {} (trust: {:.2})\n",
-                s.node.title, s.node.trust_score
-            ));
+            doc.push_str(&format!("- {}\n", s.node.title));
         }
         doc.push('\n');
     }

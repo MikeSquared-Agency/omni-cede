@@ -180,7 +180,7 @@ impl fmt::Display for EdgeKind {
 
 // ─── Node ───────────────────────────────────────────────
 
-fn now_unix() -> i64 {
+pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -499,6 +499,32 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub output: String,
     pub success: bool,
+}
+
+// ─── Turn context ───────────────────────────────────────
+
+/// Contextual metadata about the current turn, carried from the channel
+/// pipeline into the agent so it knows *who* is talking and *where*.
+#[derive(Debug, Clone)]
+pub struct TurnContext {
+    /// Channel name (e.g. "discord", "telegram", "webchat", "api").
+    pub channel: String,
+    /// Human-readable display name for the sender, if known.
+    pub sender_name: Option<String>,
+    /// Internal user ID (from identity resolution).
+    pub user_id: String,
+    /// True when the message came from a group/channel (not a DM).
+    pub is_group: bool,
+}
+
+/// A pending notification to be delivered on the user's next turn.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub id: String,
+    pub session_id: String,
+    pub summary: String,
+    pub source_node_id: Option<String>,
+    pub created_at: i64,
 }
 
 // ─── Model backend ──────────────────────────────────────

@@ -647,7 +647,13 @@ pub async fn run() -> crate::error::Result<()> {
                 if input == "exit" || input == "quit" {
                     break;
                 }
-                match agent.run_turn(&session_id, input).await {
+                let cli_ctx = crate::types::TurnContext {
+                    channel: "cli".to_string(),
+                    sender_name: None,
+                    user_id: "local".to_string(),
+                    is_group: false,
+                };
+                match agent.run_turn(&session_id, input, &cli_ctx).await {
                     Ok(response) => println!("\n{response}\n"),
                     Err(e) => eprintln!("\nError: {e}\n"),
                 }

@@ -34,6 +34,8 @@ pub struct Config {
     pub bash_max_output_bytes: usize,
     /// Shell command prefixes that are always blocked (case-insensitive substring match).
     pub bash_blocked_patterns: Vec<String>,
+    /// Maximum nodes included in the semantic briefing for a chat turn.
+    pub briefing_max_nodes: usize,
 }
 
 impl Default for Config {
@@ -65,6 +67,7 @@ impl Default for Config {
                 "init 0".into(),
                 "init 6".into(),
             ],
+            briefing_max_nodes: 16,
         }
     }
 }

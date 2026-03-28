@@ -590,8 +590,14 @@ pub async fn run_with_chat(
                                         let agent_c = agent.clone();
                                         let sid = session_id.clone();
                                         let tx = result_tx.clone();
+                                        let cli_ctx = crate::types::TurnContext {
+                                            channel: "cli-tui".to_string(),
+                                            sender_name: None,
+                                            user_id: "local".to_string(),
+                                            is_group: false,
+                                        };
                                         tokio::spawn(async move {
-                                            match agent_c.run_turn(&sid, &input).await {
+                                            match agent_c.run_turn(&sid, &input, &cli_ctx).await {
                                                 Ok(resp) => { let _ = tx.send(AgentResult::Response(resp)); }
                                                 Err(e) => { let _ = tx.send(AgentResult::Error(e.to_string())); }
                                             }

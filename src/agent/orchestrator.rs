@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::hnsw::VectorIndex;
 use crate::llm::LlmClient;
 use crate::memory;
+use crate::memory::format_timestamp;
 use crate::tools::ToolRegistry;
 use crate::types::*;
 
@@ -40,6 +41,26 @@ impl Agent {
             .await?;
 
         // Build briefing for system prompt
+        let now_ts = format_timestamp(crate::types::now_unix());
+
+        // Store user input with timestamp
+        let user_node = Node::new(NodeKind::UserInput, format!("[{now_ts}] {input}"))
+            .with_body(input)
+            .with_importance(0.4)
+            .with_decay_rate(0.02);
+        let user_node_id = user_node.id.clone();
+        self.db
+            .call({
+                let n = user_node;
+                move |conn| queries::insert_node(conn, &n)
+            })
+            .await?;
+        let edge = Edge::new(user_node_id.clone(), session_id.clone(), EdgeKind::PartOf);
+        self.db
+            .call(move |conn| queries::insert_edge(conn, &edge))
+            .await?;
+        let _ = self.auto_link_tx.try_send(user_node_id);
+
         let brief = memory::briefing_with_kinds(
             &self.db,
             &self.embed,
@@ -56,7 +77,7 @@ impl Agent {
                 NodeKind::Capability,
                 NodeKind::Limitation,
             ],
-            12,
+            self.config.briefing_max_nodes,
         )
         .await?;
 
@@ -208,8 +229,10 @@ impl Agent {
                     }
                 }
                 StopReason::EndTurn | StopReason::MaxTokens => {
-                    // Store fact from response
-                    let fact = Node::fact_from_response(&response.text, &session_id);
+                    // Store fact from response with timestamp
+                    let resp_ts = format_timestamp(crate::types::now_unix());
+                    let fact = Node::fact_from_response(&response.text, &session_id)
+                        .with_body(format!("[{resp_ts}] {}", response.text));
                     let fact_id = fact.id.clone();
                     self.db
                         .call({
@@ -262,7 +285,7 @@ impl Agent {
             }
         }
 
-        Ok("Reached iteration limit without final answer.".into())
+        Ok("I've been working on this for a while and need to stop here. Here's what I have so far — let me know if you'd like me to continue.".into())
     }
 
     /// Run a single turn within an ongoing chat session.
@@ -272,14 +295,20 @@ impl Agent {
     /// turns that are relevant surface naturally), and the LLM receives only
     /// `[system(briefing), user(input)]` — no growing message history.
     ///
-    /// Tool-call loops use a temporary message vec within the turn.
+    /// **Non-blocking design**: The first LLM call runs synchronously so the
+    /// user always gets a fast response. If the LLM requests tool calls, they
+    /// are executed in a background `tokio::spawn` task which then continues
+    /// the LLM loop and stores its final answer as a `BackgroundTask` node.
+    /// This means the user can keep chatting while tools run.
     pub async fn run_turn(
         &self,
         session_id: &NodeId,
         input: &str,
+        ctx: &TurnContext,
     ) -> Result<String> {
         // 1. Store the user's input as a UserInput node in the graph
-        let user_node = Node::new(NodeKind::UserInput, input)
+        let now_ts = format_timestamp(crate::types::now_unix());
+        let user_node = Node::new(NodeKind::UserInput, format!("[{now_ts}] {input}"))
             .with_body(input)
             .with_importance(0.4)
             .with_decay_rate(0.02);
@@ -316,8 +345,6 @@ impl Agent {
         let _ = self.auto_link_tx.try_send(user_node_id);
 
         // 2. Build a FRESH briefing using the input as semantic query
-        //    Prior UserInput nodes and Fact responses that are relevant will
-        //    surface naturally through HNSW recall.
         let brief = memory::briefing_with_kinds(
             &self.db,
             &self.embed,
@@ -335,12 +362,11 @@ impl Agent {
                 NodeKind::Capability,
                 NodeKind::Limitation,
             ],
-            16, // slightly more nodes to capture conversation context
+            self.config.briefing_max_nodes,
         )
         .await?;
 
-        // 3. Fetch recent session nodes (recency window) and merge any that
-        //    the semantic search didn't already return.
+        // 3. Fetch recent session nodes (recency window)
         let recency_window = self.config.session_recency_window;
         let briefed_ids: std::collections::HashSet<String> =
             brief.nodes.iter().map(|sn| sn.node.id.clone()).collect();
@@ -352,17 +378,18 @@ impl Agent {
             })
             .await?;
         let mut recency_section = String::new();
-        // Reverse so we go chronological (oldest first) within the section
         for node in recent_nodes.iter().rev() {
             if briefed_ids.contains(&node.id) {
-                continue; // already in semantic briefing
+                continue;
             }
             let body = node.body.as_deref().unwrap_or(&node.title);
             let label = match node.kind {
                 NodeKind::UserInput => "User",
                 _ => "Assistant",
             };
-            recency_section.push_str(&format!("- {label}: {body}\n"));
+            let ts = format_timestamp(node.created_at);
+            let rel = memory::relative_time(node.created_at);
+            recency_section.push_str(&format!("- [{ts}] ({rel}) {label}: {body}\n"));
         }
 
         let mut context_doc = brief.context_doc;
@@ -372,180 +399,381 @@ impl Agent {
             context_doc.push('\n');
         }
 
+        // ── Channel awareness ───────────────────────────
+        {
+            let sender = ctx.sender_name.as_deref().unwrap_or("someone");
+            let where_str = if ctx.is_group { "a group chat" } else { "a direct message" };
+            context_doc.push_str(&format!(
+                "## Current conversation\nYou are talking to **{}** via **{}** ({}).\n\n",
+                sender, ctx.channel, where_str,
+            ));
+        }
+
+        // ── Pending notifications (background task results) ─
+        let session_for_notif = session_id.to_string();
+        let pending = self.db.call(move |conn| {
+            queries::get_pending_notifications(conn, &session_for_notif)
+        }).await?;
+
+        if !pending.is_empty() {
+            context_doc.push_str("## Updates while you were away\n");
+            context_doc.push_str("The following background tasks finished since your last message. Mention these to the user naturally:\n");
+            let mut delivered_ids: Vec<String> = Vec::new();
+            for notif in &pending {
+                let rel = memory::relative_time(notif.created_at);
+                context_doc.push_str(&format!("- ({}) {}\n", rel, notif.summary));
+                delivered_ids.push(notif.id.clone());
+            }
+            context_doc.push('\n');
+
+            // Mark as delivered
+            if !delivered_ids.is_empty() {
+                self.db.call(move |conn| {
+                    queries::mark_notifications_delivered(conn, &delivered_ids)
+                }).await?;
+            }
+        }
+
         // 4. Build messages — just system + user, no history
-        let mut messages = vec![
+        let messages = vec![
             Message::system(context_doc),
             Message::user(input),
         ];
 
-        let mut iter: usize = 0;
+        // 5. First LLM call (synchronous — the user waits for this one)
+        let iter: usize = 1;
+        let iter_node = Node::loop_iteration(iter, session_id);
+        let iter_id = iter_node.id.clone();
+        self.db
+            .call({
+                let n = iter_node.clone();
+                move |conn| queries::insert_node(conn, &n)
+            })
+            .await?;
+        let edge = Edge::new(iter_id.clone(), session_id.to_string(), EdgeKind::PartOf);
+        self.db
+            .call(move |conn| queries::insert_edge(conn, &edge))
+            .await?;
 
+        let start = Instant::now();
+        let tool_defs = self.tools.anthropic_tool_defs();
+        let response = if tool_defs.is_empty() {
+            self.llm.complete(&messages).await?
+        } else {
+            self.llm.complete_with_tools(&messages, &tool_defs).await?
+        };
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        // Record LlmCall node
+        let llm_node = Node {
+            kind: NodeKind::LlmCall,
+            title: format!("LLM call turn iter {iter}"),
+            body: Some(
+                serde_json::json!({
+                    "model": self.llm.model_name(),
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "latency_ms": latency_ms,
+                })
+                .to_string(),
+            ),
+            ..Node::new(NodeKind::LlmCall, format!("LLM call turn iter {iter}"))
+        };
+        let llm_id = llm_node.id.clone();
+        self.db
+            .call({
+                let n = llm_node;
+                move |conn| queries::insert_node(conn, &n)
+            })
+            .await?;
+        let llm_edge = Edge::new(llm_id, iter_id.clone(), EdgeKind::PartOf);
+        self.db
+            .call(move |conn| queries::insert_edge(conn, &llm_edge))
+            .await?;
+
+        match response.stop_reason {
+            StopReason::EndTurn | StopReason::MaxTokens => {
+                // No tools needed — store and return immediately
+                let resp_ts = format_timestamp(crate::types::now_unix());
+                let fact = Node::fact_from_response(&response.text, session_id)
+                    .with_body(format!("[{resp_ts}] {}", response.text));
+                let fact_id = fact.id.clone();
+                self.db
+                    .call({
+                        let f = fact;
+                        move |conn| queries::insert_node(conn, &f)
+                    })
+                    .await?;
+                let derives = Edge::new(
+                    fact_id.clone(),
+                    session_id.to_string(),
+                    EdgeKind::DerivesFrom,
+                );
+                self.db
+                    .call(move |conn| queries::insert_edge(conn, &derives))
+                    .await?;
+                let _ = self.auto_link_tx.try_send(fact_id);
+                return Ok(response.text);
+            }
+            StopReason::ToolUse => {
+                // ── Return immediately, spawn tool execution in background ──
+                let immediate_reply = if response.text.is_empty() {
+                    "On it — I'll work on this in the background and let you know when it's done.".to_string()
+                } else {
+                    format!("{}\n\n_(Working on this in the background — I'll let you know when it's done.)_", response.text)
+                };
+
+                // Clone everything needed for the background task
+                let db = self.db.clone();
+                let llm = self.llm.clone();
+                let tool_defs = self.tools.anthropic_tool_defs();
+                let tools = self.tools.clone();
+                let auto_link_tx = self.auto_link_tx.clone();
+                let session_id = session_id.to_string();
+                let panic_session = session_id.clone();
+                let pending_calls: Vec<ToolCall> = response.tool_calls.clone();
+                let raw_content = response.raw_content.clone();
+                let response_text = response.text.clone();
+                let max_iterations = self.config.max_iterations;
+
+                // Spawn background task for tool execution + continuation
+                let handle = tokio::spawn(async move {
+                    let result = Self::background_tool_loop(
+                        db.clone(),
+                        llm,
+                        tool_defs,
+                        tools,
+                        pending_calls,
+                        raw_content,
+                        response_text,
+                        messages,
+                        session_id.clone(),
+                        max_iterations,
+                        auto_link_tx.clone(),
+                    ).await;
+
+                    // Store the final result as a BackgroundTask node
+                    let bg_ts = format_timestamp(crate::types::now_unix());
+                    let (bg_title, bg_body, notif_summary) = match &result {
+                        Ok(text) => (
+                            format!("[{bg_ts}] Background task completed"),
+                            format!("[{bg_ts}] {text}"),
+                            format!("Background task finished: {}", Self::truncate_summary(text, 120)),
+                        ),
+                        Err(e) => (
+                            format!("[{bg_ts}] Background task failed"),
+                            format!("[{bg_ts}] Error: {e}"),
+                            format!("A background task ran into a problem: {e}"),
+                        ),
+                    };
+                    let bg_node = Node::new(NodeKind::BackgroundTask, bg_title)
+                        .with_body(&bg_body)
+                        .with_importance(0.6)
+                        .with_decay_rate(0.01);
+                    let bg_id = bg_node.id.clone();
+                    if let Err(e) = db.call({
+                        let n = bg_node;
+                        move |conn| queries::insert_node(conn, &n)
+                    }).await {
+                        tracing::error!("Failed to store background task node: {e}");
+                    }
+                    let edge = Edge::new(bg_id.clone(), session_id.clone(), EdgeKind::PartOf);
+                    if let Err(e) = db.call(move |conn| queries::insert_edge(conn, &edge)).await {
+                        tracing::error!("Failed to store background task edge: {e}");
+                    }
+                    let _ = auto_link_tx.try_send(bg_id.clone());
+
+                    // Write notification so the user gets informed on next message
+                    let notif = Notification {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id: session_id.clone(),
+                        summary: notif_summary,
+                        source_node_id: Some(bg_id),
+                        created_at: crate::types::now_unix(),
+                    };
+                    if let Err(e) = db.call(move |conn| queries::insert_notification(conn, &notif)).await {
+                        tracing::error!("Failed to write notification: {e}");
+                    }
+
+                    if let Err(e) = &result {
+                        tracing::error!("Background tool loop failed: {e}");
+                    }
+                });
+
+                // Monitor for panics in a secondary task
+                let panic_db = self.db.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await {
+                        tracing::error!("Background task panicked: {e}");
+                        let notif = Notification {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            session_id: panic_session,
+                            summary: "A background task crashed unexpectedly. You may want to retry.".to_string(),
+                            source_node_id: None,
+                            created_at: crate::types::now_unix(),
+                        };
+                        let _ = panic_db.call(move |conn| queries::insert_notification(conn, &notif)).await;
+                    }
+                });
+
+                return Ok(immediate_reply);
+            }
+        }
+    }
+
+    /// Truncate text to `max_len` chars, adding "..." if truncated.
+    fn truncate_summary(text: &str, max_len: usize) -> String {
+        if text.len() <= max_len {
+            text.to_string()
+        } else {
+            format!("{}...", &text[..max_len])
+        }
+    }
+
+    /// Execute tool calls and continue the LLM loop in the background.
+    ///
+    /// This runs after `run_turn` has returned the first response to the user.
+    /// It executes all pending tool calls, feeds results back to the LLM, and
+    /// continues until the LLM produces a final answer (EndTurn) or hits
+    /// max_iterations.
+    async fn background_tool_loop(
+        db: Db,
+        llm: Arc<dyn LlmClient>,
+        tool_defs: Vec<serde_json::Value>,
+        tools: ToolRegistry,
+        pending_calls: Vec<ToolCall>,
+        raw_content: Option<serde_json::Value>,
+        response_text: String,
+        mut messages: Vec<Message>,
+        session_id: String,
+        max_iterations: usize,
+        auto_link_tx: async_channel::Sender<NodeId>,
+    ) -> crate::error::Result<String> {
+        // Push the assistant's response (with tool_use blocks)
+        if let Some(raw) = raw_content {
+            messages.push(Message::assistant_raw(raw));
+        } else {
+            messages.push(Message::assistant(&response_text));
+        }
+
+        // Execute pending tool calls using the full registry
+        let tool_results = Self::execute_tool_calls(&tools, &pending_calls, &db, &auto_link_tx, &session_id).await;
+
+        // Push tool results
+        Self::push_tool_results(&mut messages, tool_results);
+
+        // Continue LLM loop
+        let mut iter: usize = 1; // already did iter 1 in run_turn
         loop {
             iter += 1;
+            if iter > max_iterations {
+                return Ok("I worked on this as far as I could in the background. Let me know if you'd like me to pick it up again.".into());
+            }
 
-            // Write LoopIteration node
-            let iter_node = Node::loop_iteration(iter, session_id);
-            let iter_id = iter_node.id.clone();
-            self.db
-                .call({
-                    let n = iter_node.clone();
-                    move |conn| queries::insert_node(conn, &n)
-                })
-                .await?;
-
-            let edge = Edge::new(iter_id.clone(), session_id.to_string(), EdgeKind::PartOf);
-            self.db
-                .call(move |conn| queries::insert_edge(conn, &edge))
-                .await?;
-
-            // LLM call
-            let start = Instant::now();
-            let tool_defs = self.tools.anthropic_tool_defs();
             let response = if tool_defs.is_empty() {
-                self.llm.complete(&messages).await?
+                llm.complete(&messages).await?
             } else {
-                self.llm.complete_with_tools(&messages, &tool_defs).await?
+                llm.complete_with_tools(&messages, &tool_defs).await?
             };
-            let latency_ms = start.elapsed().as_millis() as u64;
-
-            // Record LlmCall node
-            let llm_node = Node {
-                kind: NodeKind::LlmCall,
-                title: format!("LLM call turn iter {iter}"),
-                body: Some(
-                    serde_json::json!({
-                        "model": self.llm.model_name(),
-                        "input_tokens": response.input_tokens,
-                        "output_tokens": response.output_tokens,
-                        "latency_ms": latency_ms,
-                    })
-                    .to_string(),
-                ),
-                ..Node::new(NodeKind::LlmCall, format!("LLM call turn iter {iter}"))
-            };
-            let llm_id = llm_node.id.clone();
-            self.db
-                .call({
-                    let n = llm_node;
-                    move |conn| queries::insert_node(conn, &n)
-                })
-                .await?;
-            let llm_edge = Edge::new(llm_id, iter_id.clone(), EdgeKind::PartOf);
-            self.db
-                .call(move |conn| queries::insert_edge(conn, &llm_edge))
-                .await?;
 
             match response.stop_reason {
+                StopReason::EndTurn | StopReason::MaxTokens => {
+                    // Store result in graph
+                    let resp_ts = format_timestamp(crate::types::now_unix());
+                    let fact = Node::fact_from_response(&response.text, &session_id)
+                        .with_body(format!("[{resp_ts}] {}", response.text));
+                    let fact_id = fact.id.clone();
+                    db.call({
+                        let f = fact;
+                        move |conn| queries::insert_node(conn, &f)
+                    }).await?;
+                    let derives = Edge::new(fact_id, session_id, EdgeKind::DerivesFrom);
+                    db.call(move |conn| queries::insert_edge(conn, &derives)).await?;
+                    return Ok(response.text);
+                }
                 StopReason::ToolUse => {
-                    // Tool calls stay in the temporary messages vec for this turn
+                    // More tool calls — execute them and keep going
                     if let Some(raw) = response.raw_content.clone() {
                         messages.push(Message::assistant_raw(raw));
                     } else {
                         messages.push(Message::assistant(&response.text));
                     }
 
-                    let mut tool_results: Vec<(String, String)> = Vec::new();
-
-                    if response.tool_calls.len() == 1 {
-                        let tc = &response.tool_calls[0];
-                        let result = self
-                            .tools
-                            .execute(
-                                &tc.name,
-                                tc.input.clone(),
-                                iter_id.clone(),
-                                &self.db,
-                                &self.auto_link_tx,
-                            )
-                            .await?;
-                        tool_results.push((tc.id.clone(), result.output));
-                    } else {
-                        let mut set = JoinSet::new();
-                        for tc in &response.tool_calls {
-                            // Validate input before spawning parallel handler
-                            if let Err(e) = self.tools.validate_input(&tc.name, &tc.input) {
-                                tool_results.push((
-                                    tc.id.clone(),
-                                    format!("Validation error: {e}"),
-                                ));
-                                continue;
-                            }
-                            let handler = self.tools.get_handler(&tc.name);
-                            let input = tc.input.clone();
-                            let id = tc.id.clone();
-                            let name = tc.name.clone();
-                            if let Some(handler) = handler {
-                                set.spawn(async move {
-                                    let result = handler(input).await;
-                                    (id, name, result)
-                                });
-                            } else {
-                                tool_results.push((
-                                    tc.id.clone(),
-                                    format!("Error: unknown tool '{}'", tc.name),
-                                ));
-                            }
-                        }
-                        while let Some(res) = set.join_next().await {
-                            match res {
-                                Ok((id, name, Ok(result))) => {
-                                    self.tools
-                                        .record_tool_call(
-                                            &name,
-                                            &result,
-                                            iter_id.clone(),
-                                            &self.db,
-                                            &self.auto_link_tx,
-                                        )
-                                        .await?;
-                                    tool_results.push((id, result.output));
-                                }
-                                Ok((id, _name, Err(e))) => {
-                                    tool_results.push((id, format!("Tool error: {e}")));
-                                }
-                                Err(e) => {
-                                    eprintln!("Tool task panicked: {e}");
-                                }
-                            }
-                        }
-                    }
-
-                    if tool_results.len() == 1 {
-                        let (id, output) = tool_results.into_iter().next().unwrap();
-                        messages.push(Message::tool_result_block(&id, &output));
-                    } else {
-                        messages.push(Message::multi_tool_result_block(tool_results));
-                    }
-                }
-                StopReason::EndTurn | StopReason::MaxTokens => {
-                    // Store the response as a Fact node in the graph
-                    let fact = Node::fact_from_response(&response.text, session_id);
-                    let fact_id = fact.id.clone();
-                    self.db
-                        .call({
-                            let f = fact;
-                            move |conn| queries::insert_node(conn, &f)
-                        })
-                        .await?;
-                    let derives = Edge::new(
-                        fact_id.clone(),
-                        session_id.to_string(),
-                        EdgeKind::DerivesFrom,
-                    );
-                    self.db
-                        .call(move |conn| queries::insert_edge(conn, &derives))
-                        .await?;
-                    let _ = self.auto_link_tx.try_send(fact_id);
-
-                    return Ok(response.text);
+                    let tool_results = Self::execute_tool_calls(&tools, &response.tool_calls, &db, &auto_link_tx, &session_id).await;
+                    Self::push_tool_results(&mut messages, tool_results);
                 }
             }
+        }
+    }
 
-            if iter >= self.config.max_iterations {
-                break;
+    /// Execute a set of tool calls (parallel when >1) and return (id, output) pairs.
+    async fn execute_tool_calls(
+        tools: &ToolRegistry,
+        calls: &[ToolCall],
+        db: &Db,
+        auto_link_tx: &async_channel::Sender<NodeId>,
+        session_id: &str,
+    ) -> Vec<(String, String)> {
+        let mut results: Vec<(String, String)> = Vec::new();
+
+        if calls.len() == 1 {
+            let tc = &calls[0];
+            match tools.execute(&tc.name, tc.input.clone(), session_id.to_string(), db, auto_link_tx).await {
+                Ok(result) => {
+                    tracing::debug!(tool=%tc.name, "background tool completed");
+                    results.push((tc.id.clone(), result.output));
+                }
+                Err(e) => {
+                    tracing::warn!(tool=%tc.name, error=%e, "background tool failed");
+                    results.push((tc.id.clone(), format!("Tool error: {e}")));
+                }
+            }
+        } else {
+            let mut set = JoinSet::new();
+            for tc in calls {
+                if let Err(e) = tools.validate_input(&tc.name, &tc.input) {
+                    results.push((tc.id.clone(), format!("Validation error: {e}")));
+                    continue;
+                }
+                let handler = tools.get_handler(&tc.name);
+                let input = tc.input.clone();
+                let id = tc.id.clone();
+                let name = tc.name.clone();
+                if let Some(handler) = handler {
+                    set.spawn(async move {
+                        let result = handler(input).await;
+                        (id, name, result)
+                    });
+                } else {
+                    results.push((tc.id.clone(), format!("Error: unknown tool '{}'", tc.name)));
+                }
+            }
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok((id, name, Ok(result))) => {
+                        tracing::debug!(tool=%name, "background tool completed");
+                        results.push((id, result.output));
+                    }
+                    Ok((id, _name, Err(e))) => {
+                        results.push((id, format!("Tool error: {e}")));
+                    }
+                    Err(e) => {
+                        tracing::error!("Background tool task panicked: {e}");
+                    }
+                }
             }
         }
 
-        Ok("Reached iteration limit without final answer.".into())
+        results
+    }
+
+    /// Push tool results into the messages vec.
+    fn push_tool_results(messages: &mut Vec<Message>, results: Vec<(String, String)>) {
+        if results.len() == 1 {
+            let (id, output) = results.into_iter().next().unwrap();
+            messages.push(Message::tool_result_block(&id, &output));
+        } else {
+            messages.push(Message::multi_tool_result_block(results));
+        }
     }
 }

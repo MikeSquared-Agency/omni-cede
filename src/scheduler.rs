@@ -198,7 +198,7 @@ fn fire_cron_job(
 ) {
     tokio::spawn(async move {
         // 1. Create a CronExecution node
-        let exec_node = Node::new(NodeKind::CronExecution, format!("CronExec: {job_title}"))
+        let exec_node = Node::new(NodeKind::CronExecution, format!("Ran scheduled task: {job_title}"))
             .with_body(&format!("Status: running\nTask: {task}"));
         let exec_id = exec_node.id.clone();
         if let Err(e) = db
@@ -251,7 +251,7 @@ fn fire_cron_job(
         };
 
         // Store result as a Fact linked to the execution
-        let fact = Node::new(NodeKind::Fact, format!("Cron result: {job_title}"))
+        let fact = Node::new(NodeKind::Fact, format!("Result of scheduled task: {job_title}"))
             .with_body(&result_body)
             .with_importance(0.5);
         let fact_id = fact.id.clone();

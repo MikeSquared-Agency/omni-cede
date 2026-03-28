@@ -28,7 +28,20 @@ pub struct Tool {
     >,
 }
 
+impl Clone for Tool {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+            trust: self.trust,
+            handler: self.handler.clone(),
+        }
+    }
+}
+
 /// Registry of available tools.
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Tool>,
 }
@@ -74,7 +87,7 @@ impl ToolRegistry {
         // Write ToolCall node
         let tool_call_node = Node {
             kind: NodeKind::ToolCall,
-            title: format!("ToolCall: {name}"),
+            title: format!("Used {name}"),
             body: Some(serde_json::json!({
                 "tool": name,
                 "input": input,
@@ -82,7 +95,7 @@ impl ToolRegistry {
                 "success": result.success,
             }).to_string()),
             trust_score: trust as f64,
-            ..Node::new(NodeKind::ToolCall, format!("ToolCall: {name}"))
+            ..Node::new(NodeKind::ToolCall, format!("Used {name}"))
         };
         let tc_id = tool_call_node.id.clone();
         db.call({
@@ -97,7 +110,7 @@ impl ToolRegistry {
 
         // If success, write Fact derived from tool result
         if result.success {
-            let fact = Node::new(NodeKind::Fact, format!("Result: {name}"))
+            let fact = Node::new(NodeKind::Fact, format!("Output from {name}"))
                 .with_body(&result.output)
                 .with_trust(trust as f64);
             let fact_id = fact.id.clone();
@@ -168,14 +181,14 @@ impl ToolRegistry {
 
         let tool_call_node = Node {
             kind: NodeKind::ToolCall,
-            title: format!("ToolCall: {name}"),
+            title: format!("Used {name}"),
             body: Some(serde_json::json!({
                 "tool": name,
                 "output": &result.output,
                 "success": result.success,
             }).to_string()),
             trust_score: trust as f64,
-            ..Node::new(NodeKind::ToolCall, format!("ToolCall: {name}"))
+            ..Node::new(NodeKind::ToolCall, format!("Used {name}"))
         };
         let tc_id = tool_call_node.id.clone();
         db.call({
@@ -188,7 +201,7 @@ impl ToolRegistry {
         db.call(move |conn| queries::insert_edge(conn, &edge)).await?;
 
         if result.success {
-            let fact = Node::new(NodeKind::Fact, format!("Result: {name}"))
+            let fact = Node::new(NodeKind::Fact, format!("Output from {name}"))
                 .with_body(&result.output)
                 .with_trust(trust as f64);
             let fact_id = fact.id.clone();
@@ -1173,7 +1186,7 @@ pub fn builtin_registry_core(
 
                     let task_node = Node::new(
                         NodeKind::BackgroundTask,
-                        format!("Task: {}", &task),
+                        format!("Working on: {}", &task),
                     )
                     .with_body(&format!("Status: running\n\n{full_task}"))
                     .with_importance(0.6);
@@ -1224,7 +1237,7 @@ pub fn builtin_registry_core(
 
                         let result_fact = Node::new(
                             NodeKind::Fact,
-                            format!("Task result: {}", &task),
+                            format!("Finished: {}", &task),
                         )
                         .with_body(&body)
                         .with_importance(0.6);
