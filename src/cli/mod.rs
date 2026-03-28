@@ -135,7 +135,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.auto_link_tx.clone(),
                     Some(llm),
                     cx.config.clone(),
-                ),
+                ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
 
@@ -245,7 +245,7 @@ pub async fn run() -> crate::error::Result<()> {
                         state.cx.auto_link_tx.clone(),
                         Some(state.agent.llm.clone()),
                         state.cx.config.clone(),
-                    ),
+                    ).await,
                     auto_link_tx: state.cx.auto_link_tx.clone(),
                 });
                 tokio::spawn(async move {
@@ -407,7 +407,7 @@ pub async fn run() -> crate::error::Result<()> {
                                 cx.auto_link_tx.clone(),
                                 Some(llm),
                                 cx.config.clone(),
-                            ),
+                            ).await,
                             auto_link_tx: cx.auto_link_tx.clone(),
                         };
 
@@ -620,7 +620,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.auto_link_tx.clone(),
                     Some(llm),
                     cx.config.clone(),
-                ),
+                ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
 
@@ -647,7 +647,13 @@ pub async fn run() -> crate::error::Result<()> {
                 if input == "exit" || input == "quit" {
                     break;
                 }
-                match agent.run_turn(&session_id, input).await {
+                let cli_ctx = crate::types::TurnContext {
+                    channel: "cli".to_string(),
+                    sender_name: None,
+                    user_id: "local".to_string(),
+                    is_group: false,
+                };
+                match agent.run_turn(&session_id, input, &cli_ctx).await {
                     Ok(response) => println!("\n{response}\n"),
                     Err(e) => eprintln!("\nError: {e}\n"),
                 }
@@ -671,7 +677,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.auto_link_tx.clone(),
                     Some(llm),
                     cx.config.clone(),
-                ),
+                ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
             };
 

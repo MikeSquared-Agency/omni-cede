@@ -33,6 +33,8 @@ fn kind_color(kind: NodeKind) -> Color {
         | NodeKind::ToolCall | NodeKind::LoopIteration => Color::Yellow,
         NodeKind::Pattern | NodeKind::Limitation | NodeKind::Capability => Color::Green,
         NodeKind::BackgroundTask => Color::Blue,
+        NodeKind::CronJob | NodeKind::CronExecution | NodeKind::Skill => Color::LightBlue,
+        NodeKind::Notification => Color::LightYellow,
     }
 }
 
@@ -75,6 +77,9 @@ fn node_category(kind: NodeKind) -> &'static str {
         | NodeKind::ToolCall | NodeKind::LoopIteration => "Operational",
         NodeKind::Pattern | NodeKind::Limitation | NodeKind::Capability => "Self-Model",
         NodeKind::BackgroundTask => "Tasks",
+        NodeKind::CronJob | NodeKind::CronExecution => "Scheduler",
+        NodeKind::Skill => "Skills",
+        NodeKind::Notification => "Notifications",
     }
 }
 
@@ -587,8 +592,14 @@ pub async fn run_with_chat(
                                         let agent_c = agent.clone();
                                         let sid = session_id.clone();
                                         let tx = result_tx.clone();
+                                        let cli_ctx = crate::types::TurnContext {
+                                            channel: "cli-tui".to_string(),
+                                            sender_name: None,
+                                            user_id: "local".to_string(),
+                                            is_group: false,
+                                        };
                                         tokio::spawn(async move {
-                                            match agent_c.run_turn(&sid, &input).await {
+                                            match agent_c.run_turn(&sid, &input, &cli_ctx).await {
                                                 Ok(resp) => { let _ = tx.send(AgentResult::Response(resp)); }
                                                 Err(e) => { let _ = tx.send(AgentResult::Error(e.to_string())); }
                                             }

@@ -24,6 +24,10 @@ fn kind_color(kind: NodeKind) -> &'static str {
         NodeKind::Pattern | NodeKind::Limitation | NodeKind::Capability => "\x1b[92m",
         // Background tasks → blue
         NodeKind::BackgroundTask => "\x1b[94m",
+        // Cron / skills → light blue
+        NodeKind::CronJob | NodeKind::CronExecution | NodeKind::Skill => "\x1b[94m",
+        // Notifications → light yellow
+        NodeKind::Notification => "\x1b[93m",
     }
 }
 
@@ -58,6 +62,9 @@ fn kind_category(kind: NodeKind) -> &'static str {
         | NodeKind::ToolCall | NodeKind::LoopIteration => "Operational",
         NodeKind::Pattern | NodeKind::Limitation | NodeKind::Capability => "Self-Model",
         NodeKind::BackgroundTask => "Tasks",
+        NodeKind::CronJob | NodeKind::CronExecution => "Scheduler",
+        NodeKind::Skill => "Skills",
+        NodeKind::Notification => "Notifications",
     }
 }
 

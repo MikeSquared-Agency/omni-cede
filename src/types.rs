@@ -30,6 +30,13 @@ pub enum NodeKind {
     LoopIteration,
     // Background tasks
     BackgroundTask,
+    // Scheduled tasks
+    CronJob,
+    CronExecution,
+    // Dynamic skills / plugins
+    Skill,
+    // Notifications — delivered via graph, not a separate table
+    Notification,
     // Self-model — medium decay
     Pattern,
     Limitation,
@@ -53,6 +60,10 @@ impl NodeKind {
             Self::ToolCall => "tool_call",
             Self::LoopIteration => "loop_iteration",
             Self::BackgroundTask => "background_task",
+            Self::CronJob => "cron_job",
+            Self::CronExecution => "cron_execution",
+            Self::Skill => "skill",
+            Self::Notification => "notification",
             Self::Pattern => "pattern",
             Self::Limitation => "limitation",
             Self::Capability => "capability",
@@ -75,6 +86,10 @@ impl NodeKind {
             "tool_call" => Some(Self::ToolCall),
             "loop_iteration" => Some(Self::LoopIteration),
             "background_task" => Some(Self::BackgroundTask),
+            "cron_job" => Some(Self::CronJob),
+            "cron_execution" => Some(Self::CronExecution),
+            "skill" => Some(Self::Skill),
+            "notification" => Some(Self::Notification),
             "pattern" => Some(Self::Pattern),
             "limitation" => Some(Self::Limitation),
             "capability" => Some(Self::Capability),
@@ -89,6 +104,12 @@ impl NodeKind {
             Self::Soul | Self::Belief | Self::Goal => 0.0,
             // User inputs decay moderately (they're conversation context)
             Self::UserInput => 0.02,
+            // Cron definitions persist like identity
+            Self::CronJob | Self::Skill => 0.0,
+            // Cron executions decay fast like operational nodes
+            Self::CronExecution => 0.05,
+            // Notifications decay fast (ephemeral once delivered)
+            Self::Notification => 0.05,
             // Operational nodes decay fast
             Self::Session | Self::Turn | Self::LlmCall
             | Self::ToolCall | Self::LoopIteration => 0.05,
@@ -103,7 +124,10 @@ impl NodeKind {
     pub fn default_importance(&self) -> f64 {
         match self {
             Self::Soul | Self::Belief | Self::Goal => 1.0,
+            Self::CronJob | Self::Skill => 0.8,
             Self::UserInput => 0.4,
+            Self::CronExecution => 0.2,
+            Self::Notification => 0.3,
             Self::Session | Self::Turn | Self::LlmCall
             | Self::ToolCall | Self::LoopIteration => 0.2,
             _ => 0.5,
@@ -163,7 +187,7 @@ impl fmt::Display for EdgeKind {
 
 // ─── Node ───────────────────────────────────────────────
 
-fn now_unix() -> i64 {
+pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -247,8 +271,15 @@ impl Node {
     }
 
     pub fn loop_iteration(iter: usize, session_id: &NodeId) -> Self {
-        Node::new(NodeKind::LoopIteration, format!("Iteration {iter}"))
+        let ts = crate::memory::format_timestamp(now_unix());
+        Node::new(NodeKind::LoopIteration, format!("[{ts}] Iteration {iter}"))
             .with_body(format!("session:{session_id}"))
+    }
+
+    pub fn notification(summary: impl Into<String>) -> Self {
+        let s = summary.into();
+        let ts = crate::memory::format_timestamp(now_unix());
+        Node::new(NodeKind::Notification, format!("[{ts}] {s}"))
     }
 
     pub fn fact_from_response(text: &str, _session_id: &NodeId) -> Self {
@@ -482,6 +513,22 @@ pub struct ToolCall {
 pub struct ToolResult {
     pub output: String,
     pub success: bool,
+}
+
+// ─── Turn context ───────────────────────────────────────
+
+/// Contextual metadata about the current turn, carried from the channel
+/// pipeline into the agent so it knows *who* is talking and *where*.
+#[derive(Debug, Clone)]
+pub struct TurnContext {
+    /// Channel name (e.g. "discord", "telegram", "webchat", "api").
+    pub channel: String,
+    /// Human-readable display name for the sender, if known.
+    pub sender_name: Option<String>,
+    /// Internal user ID (from identity resolution).
+    pub user_id: String,
+    /// True when the message came from a group/channel (not a DM).
+    pub is_group: bool,
 }
 
 // ─── Model backend ──────────────────────────────────────

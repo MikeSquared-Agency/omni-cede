@@ -30,6 +30,7 @@ use crate::db::Db;
 use crate::error::{CortexError, Result};
 use crate::identity::{self, ChannelId};
 use crate::session;
+use crate::types::TurnContext;
 
 use super::hooks::ChannelHook;
 use super::registry::ChannelRegistry;
@@ -97,8 +98,15 @@ impl Pipeline {
         }
 
         // ── 5. Agent ────────────────────────────────────
+        let turn_ctx = TurnContext {
+            channel: envelope.channel.clone(),
+            sender_name: envelope.sender_name.clone().or(user.display_name.clone()),
+            user_id: user.id.clone(),
+            is_group: envelope.group_id.is_some(),
+        };
+
         let mut reply = agent
-            .run_turn(&managed.node_id, &envelope.text)
+            .run_turn(&managed.node_id, &envelope.text, &turn_ctx)
             .await
             .map_err(|e| CortexError::Pipeline(format!("Agent error: {e}")))?;
 
@@ -163,8 +171,15 @@ impl Pipeline {
             hook.before_agent(&mut envelope).await?;
         }
 
+        let turn_ctx = TurnContext {
+            channel: envelope.channel.clone(),
+            sender_name: envelope.sender_name.clone().or(user.display_name.clone()),
+            user_id: user.id.clone(),
+            is_group: envelope.group_id.is_some(),
+        };
+
         let mut reply = agent
-            .run_turn(&managed.node_id, &envelope.text)
+            .run_turn(&managed.node_id, &envelope.text, &turn_ctx)
             .await
             .map_err(|e| CortexError::Pipeline(format!("Agent error: {e}")))?;
 

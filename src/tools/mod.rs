@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use tokio::process::Command as TokioCommand;
@@ -11,6 +12,7 @@ use crate::db::queries;
 use crate::embed::EmbedHandle;
 use crate::error::{CortexError, Result};
 use crate::hnsw::VectorIndex;
+use crate::memory::format_timestamp;
 use crate::types::*;
 
 /// A tool the agent can call. The handler is an async function that
@@ -27,7 +29,20 @@ pub struct Tool {
     >,
 }
 
+impl Clone for Tool {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+            trust: self.trust,
+            handler: self.handler.clone(),
+        }
+    }
+}
+
 /// Registry of available tools.
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Tool>,
 }
@@ -71,9 +86,10 @@ impl ToolRegistry {
         let result = (tool.handler)(input.clone()).await?;
 
         // Write ToolCall node
+        let ts = format_timestamp(crate::types::now_unix());
         let tool_call_node = Node {
             kind: NodeKind::ToolCall,
-            title: format!("ToolCall: {name}"),
+            title: format!("[{ts}] Used {name}"),
             body: Some(serde_json::json!({
                 "tool": name,
                 "input": input,
@@ -81,7 +97,7 @@ impl ToolRegistry {
                 "success": result.success,
             }).to_string()),
             trust_score: trust as f64,
-            ..Node::new(NodeKind::ToolCall, format!("ToolCall: {name}"))
+            ..Node::new(NodeKind::ToolCall, format!("[{ts}] Used {name}"))
         };
         let tc_id = tool_call_node.id.clone();
         db.call({
@@ -96,7 +112,7 @@ impl ToolRegistry {
 
         // If success, write Fact derived from tool result
         if result.success {
-            let fact = Node::new(NodeKind::Fact, format!("Result: {name}"))
+            let fact = Node::new(NodeKind::Fact, format!("Output from {name}"))
                 .with_body(&result.output)
                 .with_trust(trust as f64);
             let fact_id = fact.id.clone();
@@ -165,16 +181,17 @@ impl ToolRegistry {
     ) -> Result<()> {
         let trust = self.get(name).map(|t| t.trust).unwrap_or(0.5);
 
+        let ts = format_timestamp(crate::types::now_unix());
         let tool_call_node = Node {
             kind: NodeKind::ToolCall,
-            title: format!("ToolCall: {name}"),
+            title: format!("[{ts}] Used {name}"),
             body: Some(serde_json::json!({
                 "tool": name,
                 "output": &result.output,
                 "success": result.success,
             }).to_string()),
             trust_score: trust as f64,
-            ..Node::new(NodeKind::ToolCall, format!("ToolCall: {name}"))
+            ..Node::new(NodeKind::ToolCall, format!("[{ts}] Used {name}"))
         };
         let tc_id = tool_call_node.id.clone();
         db.call({
@@ -187,7 +204,7 @@ impl ToolRegistry {
         db.call(move |conn| queries::insert_edge(conn, &edge)).await?;
 
         if result.success {
-            let fact = Node::new(NodeKind::Fact, format!("Result: {name}"))
+            let fact = Node::new(NodeKind::Fact, format!("[{ts}] Output from {name}"))
                 .with_body(&result.output)
                 .with_trust(trust as f64);
             let fact_id = fact.id.clone();
@@ -239,9 +256,10 @@ impl ToolRegistry {
 
 // ─── Built-in tools ─────────────────────────────────────
 
-/// Create a registry pre-loaded with the built-in cortex tools.
-/// Pass `llm` to enable the `spawn_task` tool (background task loops).
-pub fn builtin_registry(
+/// Create a registry pre-loaded with the built-in cortex tools (synchronous).
+/// This contains all tool definitions but does NOT load persisted skills from the DB.
+/// Use `builtin_registry()` (async) for the full registry including persisted skills.
+pub fn builtin_registry_core(
     db: Db,
     embed: EmbedHandle,
     hnsw: Arc<RwLock<VectorIndex>>,
@@ -1171,7 +1189,7 @@ pub fn builtin_registry(
 
                     let task_node = Node::new(
                         NodeKind::BackgroundTask,
-                        format!("Task: {}", &task),
+                        format!("[{}] Working on: {}", format_timestamp(crate::types::now_unix()), &task),
                     )
                     .with_body(&format!("Status: running\n\n{full_task}"))
                     .with_importance(0.6);
@@ -1191,7 +1209,7 @@ pub fn builtin_registry(
                     let bg_config = config.clone();
 
                     tokio::spawn(async move {
-                        let bg_tools = builtin_registry(
+                        let bg_tools = builtin_registry_core(
                             bg_db.clone(),
                             bg_embed.clone(),
                             bg_hnsw.clone(),
@@ -1222,7 +1240,7 @@ pub fn builtin_registry(
 
                         let result_fact = Node::new(
                             NodeKind::Fact,
-                            format!("Task result: {}", &task),
+                            format!("Finished: {}", &task),
                         )
                         .with_body(&body)
                         .with_importance(0.6);
@@ -1258,6 +1276,523 @@ pub fn builtin_registry(
                 })
             }),
         });
+    }
+
+    // ── schedule_cron: create a recurring scheduled task ──
+    {
+        let db = db.clone();
+        reg.register(Tool {
+            name: "schedule_cron".to_string(),
+            description: concat!(
+                "Create a recurring scheduled task (cron job). The task runs autonomously ",
+                "on the specified schedule with its own agent loop and full tool access. ",
+                "Results are stored in the graph as CronExecution nodes. ",
+                "Use standard 7-field cron expressions: sec min hour day month weekday year. ",
+                "Examples: '0 0 * * * * *' (every hour), '0 */30 * * * * *' (every 30 min), ",
+                "'0 0 9 * * MON-FRI *' (9am weekdays)."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short name for the cron job (e.g. 'Daily health check')"
+                    },
+                    "cron": {
+                        "type": "string",
+                        "description": "Cron expression (7 fields: sec min hour day month weekday year)"
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "What the agent should do each time this fires. Be specific."
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Max agent loop iterations per execution (default: 5, max: 15)"
+                    }
+                },
+                "required": ["name", "cron", "task"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let name = input["name"].as_str().unwrap_or("Unnamed cron").to_string();
+                    let cron_expr = input["cron"].as_str().unwrap_or("").to_string();
+                    let task = input["task"].as_str().unwrap_or("").to_string();
+                    let max_iter = input["max_iterations"].as_u64().unwrap_or(5).min(15) as usize;
+
+                    if cron_expr.is_empty() || task.is_empty() {
+                        return Ok(ToolResult {
+                            output: "Error: cron and task are required.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Validate cron expression
+                    if cron::Schedule::from_str(&cron_expr).is_err() {
+                        return Ok(ToolResult {
+                            output: format!(
+                                "Invalid cron expression: '{}'. Use 7 fields: sec min hour day month weekday year.",
+                                cron_expr
+                            ),
+                            success: false,
+                        });
+                    }
+
+                    let meta = crate::scheduler::CronJobMeta {
+                        cron: cron_expr.clone(),
+                        task: task.clone(),
+                        max_iterations: max_iter,
+                        enabled: true,
+                        last_fired: 0,
+                    };
+
+                    let node = Node {
+                        kind: NodeKind::CronJob,
+                        title: format!("Cron: {name}"),
+                        body: Some(serde_json::to_string(&meta).unwrap()),
+                        importance: 0.8,
+                        decay_rate: 0.0,
+                        ..Node::new(NodeKind::CronJob, format!("Cron: {name}"))
+                    };
+                    let node_id = node.id.clone();
+                    db.call({
+                        let n = node;
+                        move |conn| queries::insert_node(conn, &n)
+                    })
+                    .await?;
+
+                    Ok(ToolResult {
+                        output: format!(
+                            "Cron job created: '{}' (id: {})\nSchedule: {}\nTask: {}",
+                            name, &node_id[..8], cron_expr, task
+                        ),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── delete_cron: remove a scheduled task ──
+    {
+        let db = db.clone();
+        reg.register(Tool {
+            name: "delete_cron".to_string(),
+            description: "Delete a cron job by its node ID prefix. Use list_crons to find IDs.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Cron job node ID or unique prefix (at least 6 chars)"
+                    }
+                },
+                "required": ["node_id"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let raw_id = input["node_id"].as_str().unwrap_or("").to_string();
+                    if raw_id.len() < 6 {
+                        return Ok(ToolResult {
+                            output: "Error: node_id must be at least 6 characters.".into(),
+                            success: false,
+                        });
+                    }
+
+                    let full_id = {
+                        let rid = raw_id.clone();
+                        let matches = db.call(move |conn| queries::find_nodes_by_prefix(conn, &rid)).await?;
+                        match matches.len() {
+                            0 => return Ok(ToolResult {
+                                output: format!("No node found with prefix '{raw_id}'"),
+                                success: false,
+                            }),
+                            1 => matches.into_iter().next().unwrap(),
+                            n => return Ok(ToolResult {
+                                output: format!("Ambiguous prefix '{raw_id}' matches {n} nodes."),
+                                success: false,
+                            }),
+                        }
+                    };
+
+                    // Verify it's a CronJob
+                    let node = {
+                        let id = full_id.clone();
+                        db.call(move |conn| queries::get_node(conn, &id)).await?
+                    };
+                    match &node {
+                        Some(n) if n.kind == NodeKind::CronJob => {},
+                        Some(n) => return Ok(ToolResult {
+                            output: format!("Node {} is a {}, not a cron_job.", &full_id[..8], n.kind),
+                            success: false,
+                        }),
+                        None => return Ok(ToolResult {
+                            output: format!("Node {raw_id} not found."),
+                            success: false,
+                        }),
+                    }
+
+                    let title = node.unwrap().title;
+                    let id_del = full_id.clone();
+                    db.call(move |conn| queries::delete_node(conn, &id_del)).await?;
+
+                    Ok(ToolResult {
+                        output: format!("Deleted cron job '{}' ({})", title, &full_id[..8]),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── list_crons: show all scheduled tasks ──
+    {
+        let db = db.clone();
+        reg.register(Tool {
+            name: "list_crons".to_string(),
+            description: "List all cron jobs (scheduled tasks) currently in the graph.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+            trust: 1.0,
+            handler: Arc::new(move |_input| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let nodes = db
+                        .call(|conn| queries::get_nodes_by_kind(conn, NodeKind::CronJob))
+                        .await?;
+
+                    if nodes.is_empty() {
+                        return Ok(ToolResult {
+                            output: "No cron jobs found.".to_string(),
+                            success: true,
+                        });
+                    }
+
+                    let mut out = format!("{} cron job(s):\n", nodes.len());
+                    for n in &nodes {
+                        let meta: Option<crate::scheduler::CronJobMeta> = n
+                            .body
+                            .as_deref()
+                            .and_then(|b| serde_json::from_str(b).ok());
+                        if let Some(m) = meta {
+                            let status = if m.enabled { "active" } else { "paused" };
+                            let last = if m.last_fired == 0 {
+                                "never".to_string()
+                            } else {
+                                chrono::DateTime::from_timestamp(m.last_fired, 0)
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                                    .unwrap_or_else(|| "?".to_string())
+                            };
+                            out.push_str(&format!(
+                                "- {} (id: {}, {}) — schedule: '{}', last: {}\n  task: {}\n",
+                                n.title, &n.id[..8], status, m.cron, last, m.task,
+                            ));
+                        } else {
+                            out.push_str(&format!("- {} (id: {}, invalid metadata)\n", n.title, &n.id[..8]));
+                        }
+                    }
+                    Ok(ToolResult { output: out, success: true })
+                })
+            }),
+        });
+    }
+
+    // ── create_skill: define a dynamic prompt-based tool ──
+    {
+        let db = db.clone();
+        reg.register(Tool {
+            name: "create_skill".to_string(),
+            description: concat!(
+                "Create a dynamic skill (prompt-based tool). When another agent or session ",
+                "calls this skill, the LLM receives the skill's instructions plus the caller's ",
+                "input, and returns a result. Skills persist in the graph as Skill nodes and ",
+                "are available after restart. Use this for reusable capabilities: ",
+                "code review templates, analysis frameworks, domain-specific procedures."
+            ).to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Tool name (snake_case, e.g. 'code_review')"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What this skill does (shown to the LLM when choosing tools)"
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Detailed instructions for executing this skill. This becomes the system prompt when the skill runs."
+                    },
+                    "input_fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "type": { "type": "string", "enum": ["string", "number", "boolean"] },
+                                "description": { "type": "string" },
+                                "required": { "type": "boolean" }
+                            }
+                        },
+                        "description": "Input parameters the skill accepts (optional — defaults to a single 'input' string field)"
+                    }
+                },
+                "required": ["name", "description", "instructions"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let name = input["name"].as_str().unwrap_or("").to_string();
+                    let description = input["description"].as_str().unwrap_or("").to_string();
+                    let instructions = input["instructions"].as_str().unwrap_or("").to_string();
+                    let input_fields = input["input_fields"].clone();
+
+                    if name.is_empty() || description.is_empty() || instructions.is_empty() {
+                        return Ok(ToolResult {
+                            output: "Error: name, description, and instructions are all required.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Validate name is snake_case-ish
+                    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        return Ok(ToolResult {
+                            output: "Error: skill name must be alphanumeric with underscores only.".into(),
+                            success: false,
+                        });
+                    }
+
+                    // Build the skill definition
+                    let skill_def = serde_json::json!({
+                        "name": name,
+                        "description": description,
+                        "instructions": instructions,
+                        "input_fields": input_fields,
+                    });
+
+                    let node = Node {
+                        kind: NodeKind::Skill,
+                        title: format!("Skill: {name}"),
+                        body: Some(serde_json::to_string(&skill_def).unwrap()),
+                        importance: 0.8,
+                        decay_rate: 0.0,
+                        ..Node::new(NodeKind::Skill, format!("Skill: {name}"))
+                    };
+                    let node_id = node.id.clone();
+                    db.call({
+                        let n = node;
+                        move |conn| queries::insert_node(conn, &n)
+                    })
+                    .await?;
+
+                    Ok(ToolResult {
+                        output: format!(
+                            "Skill '{}' created (id: {}). It will be available as a tool in new sessions after restart.",
+                            name, &node_id[..8]
+                        ),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── delete_skill: remove a dynamic skill ──
+    {
+        let db = db.clone();
+        reg.register(Tool {
+            name: "delete_skill".to_string(),
+            description: "Delete a dynamic skill by its node ID prefix. Use list_memories with kind=Skill to find IDs.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Skill node ID or unique prefix (at least 6 chars)"
+                    }
+                },
+                "required": ["node_id"]
+            }),
+            trust: 0.8,
+            handler: Arc::new(move |input| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let raw_id = input["node_id"].as_str().unwrap_or("").to_string();
+                    if raw_id.len() < 6 {
+                        return Ok(ToolResult {
+                            output: "Error: node_id must be at least 6 characters.".into(),
+                            success: false,
+                        });
+                    }
+
+                    let full_id = {
+                        let rid = raw_id.clone();
+                        let matches = db.call(move |conn| queries::find_nodes_by_prefix(conn, &rid)).await?;
+                        match matches.len() {
+                            0 => return Ok(ToolResult {
+                                output: format!("No node found with prefix '{raw_id}'"),
+                                success: false,
+                            }),
+                            1 => matches.into_iter().next().unwrap(),
+                            n => return Ok(ToolResult {
+                                output: format!("Ambiguous prefix '{raw_id}' matches {n} nodes."),
+                                success: false,
+                            }),
+                        }
+                    };
+
+                    // Verify it's a Skill
+                    let node = {
+                        let id = full_id.clone();
+                        db.call(move |conn| queries::get_node(conn, &id)).await?
+                    };
+                    match &node {
+                        Some(n) if n.kind == NodeKind::Skill => {},
+                        Some(n) => return Ok(ToolResult {
+                            output: format!("Node {} is a {}, not a skill.", &full_id[..8], n.kind),
+                            success: false,
+                        }),
+                        None => return Ok(ToolResult {
+                            output: format!("Node {raw_id} not found."),
+                            success: false,
+                        }),
+                    }
+
+                    let title = node.unwrap().title;
+                    let id_del = full_id.clone();
+                    db.call(move |conn| queries::delete_node(conn, &id_del)).await?;
+
+                    Ok(ToolResult {
+                        output: format!("Deleted skill '{}' ({})", title, &full_id[..8]),
+                        success: true,
+                    })
+                })
+            }),
+        });
+    }
+
+    // ── Browser tools (feature-gated) ──
+    #[cfg(feature = "browser")]
+    {
+        crate::browser::tools::register_browser_tools(&mut reg);
+    }
+
+    reg
+}
+
+/// Create a full registry including persisted skills loaded from the graph.
+/// This is the async version that wraps `builtin_registry_core` and adds
+/// dynamically-created skill tools from the DB.
+pub async fn builtin_registry(
+    db: Db,
+    embed: EmbedHandle,
+    hnsw: Arc<RwLock<VectorIndex>>,
+    auto_link_tx: async_channel::Sender<crate::types::NodeId>,
+    llm: Option<Arc<dyn crate::llm::LlmClient>>,
+    config: crate::config::Config,
+) -> ToolRegistry {
+    let mut reg = builtin_registry_core(
+        db.clone(), embed, hnsw, auto_link_tx, llm, config,
+    );
+
+    // ── Load persisted dynamic skills from graph ──
+    // They become prompt-based tools that delegate to the LLM.
+    {
+        let skill_nodes = match db.call(|conn| queries::get_nodes_by_kind(conn, NodeKind::Skill)).await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::warn!("failed to load persisted skills: {e}");
+                vec![]
+            }
+        };
+
+        for skill_node in skill_nodes {
+            let skill_def: serde_json::Value = match &skill_node.body {
+                Some(body) => match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+                None => continue,
+            };
+
+            let skill_name = skill_def["name"].as_str().unwrap_or("").to_string();
+            let skill_desc = skill_def["description"].as_str().unwrap_or("").to_string();
+            let instructions = skill_def["instructions"].as_str().unwrap_or("").to_string();
+
+            if skill_name.is_empty() || instructions.is_empty() {
+                continue;
+            }
+
+            // Build input schema from input_fields or use default
+            let input_schema = if let Some(fields) = skill_def["input_fields"].as_array() {
+                let mut properties = serde_json::Map::new();
+                let mut required = Vec::new();
+                for field in fields {
+                    let fname = field["name"].as_str().unwrap_or("input");
+                    let ftype = field["type"].as_str().unwrap_or("string");
+                    let fdesc = field["description"].as_str().unwrap_or("");
+                    properties.insert(
+                        fname.to_string(),
+                        serde_json::json!({ "type": ftype, "description": fdesc }),
+                    );
+                    if field["required"].as_bool().unwrap_or(false) {
+                        required.push(serde_json::Value::String(fname.to_string()));
+                    }
+                }
+                serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                })
+            } else {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "Input for this skill"
+                        }
+                    },
+                    "required": ["input"]
+                })
+            };
+
+            // The handler: format the input with instructions and return
+            // a structured prompt result. The actual LLM call happens when
+            // the orchestrator processes the tool result.
+            let instr = instructions.clone();
+            reg.register(Tool {
+                name: format!("skill_{skill_name}"),
+                description: format!("[Dynamic Skill] {skill_desc}"),
+                input_schema,
+                trust: 0.7,
+                handler: Arc::new(move |input| {
+                    let instr = instr.clone();
+                    Box::pin(async move {
+                        // Build a formatted prompt from instructions + input
+                        let input_str = serde_json::to_string_pretty(&input).unwrap_or_default();
+                        Ok(ToolResult {
+                            output: format!(
+                                "[Skill Execution]\nInstructions: {instr}\n\nInput: {input_str}\n\n\
+                                 Please follow the instructions above to process this input and provide your result."
+                            ),
+                            success: true,
+                        })
+                    })
+                }),
+            });
+
+            tracing::info!("loaded persisted skill: skill_{skill_name}");
+        }
     }
 
     reg

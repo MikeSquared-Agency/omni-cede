@@ -718,3 +718,45 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
     }
     bytemuck::cast_slice::<u8, f32>(blob).to_vec()
 }
+
+// ─── Notification nodes (graph-native) ──────────────────
+
+/// Fetch all undelivered Notification nodes linked to a session, oldest first.
+/// A notification is "undelivered" when access_count == 0.
+pub fn get_pending_notification_nodes(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.kind, n.title, n.body, n.importance, n.trust_score,
+                n.access_count, n.created_at, n.last_access, n.decay_rate
+         FROM nodes n
+         JOIN edges e ON e.src = n.id
+         WHERE n.kind = 'notification'
+           AND n.access_count = 0
+           AND e.dst = ?1
+           AND e.kind = 'part_of'
+         ORDER BY n.created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        let kind_str: String = row.get(1)?;
+        Ok(Node {
+            id: row.get(0)?,
+            kind: NodeKind::from_str_opt(&kind_str).unwrap_or(NodeKind::Fact),
+            title: row.get(2)?,
+            body: row.get(3)?,
+            importance: row.get(4)?,
+            trust_score: row.get(5)?,
+            access_count: row.get(6)?,
+            created_at: row.get(7)?,
+            last_access: row.get(8)?,
+            decay_rate: row.get(9)?,
+            embedding: None,
+        })
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
