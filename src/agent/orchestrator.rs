@@ -292,7 +292,14 @@ impl Agent {
             }
         }
 
-        Ok("I've been working on this for a while and need to stop here. Here's what I have so far — let me know if you'd like me to continue.".into())
+        // Max iterations reached — ask the LLM to summarise with full context
+        messages.push(Message::user(
+            "You've reached the maximum number of iterations for this task. \
+             Summarise what you accomplished so far and let the user know \
+             they can ask you to continue if needed. Be concise and natural."
+        ));
+        let wrap_up = self.llm.complete(&messages).await?;
+        Ok(wrap_up.text)
     }
 
     /// Run a single turn within an ongoing chat session.
@@ -466,6 +473,10 @@ impl Agent {
         } else {
             Message::user(input)
         };
+        // Clone context_doc before it's moved into messages — needed for
+        // the acknowledgment LLM call if the model returns tool calls with
+        // no accompanying text.
+        let context_doc_for_ack = context_doc.clone();
         let messages = vec![
             Message::system(context_doc),
             user_msg,
@@ -549,9 +560,25 @@ impl Agent {
             StopReason::ToolUse => {
                 // ── Return immediately, spawn tool execution in background ──
                 // Use the LLM's own natural acknowledgment text. If it sent
-                // tool calls with no accompanying text, provide a brief default.
+                // tool calls with no accompanying text, make a quick LLM call
+                // with the full briefing to generate a natural acknowledgment.
                 let immediate_reply = if response.text.is_empty() {
-                    "On it.".to_string()
+                    let ack_messages = vec![
+                        Message::system(context_doc_for_ack.clone()),
+                        Message::user(format!(
+                            "The user said: \"{}\"\n\n\
+                             You are about to use tools to handle this. \
+                             Write a brief, natural acknowledgment (one short sentence) \
+                             so the user knows you're working on it. Do NOT describe \
+                             what tools you'll use or what you're doing. Just a quick, \
+                             human acknowledgment. Stay in character.",
+                            input
+                        )),
+                    ];
+                    match self.llm.complete(&ack_messages).await {
+                        Ok(ack) if !ack.text.is_empty() => ack.text,
+                        _ => response.text.clone(),
+                    }
                 } else {
                     response.text.clone()
                 };
@@ -648,7 +675,7 @@ impl Agent {
                     if let Err(e) = handle.await {
                         tracing::error!("Background task panicked: {e}");
                         let notif_node = Node::notification(
-                            "A background task crashed unexpectedly. You may want to retry.",
+                            &format!("A background task crashed with error: {e}"),
                         );
                         let notif_id = notif_node.id.clone();
                         let _ = panic_db.call({
@@ -711,7 +738,14 @@ impl Agent {
         loop {
             iter += 1;
             if iter > max_iterations {
-                return Ok("I worked on this as far as I could in the background. Let me know if you'd like me to pick it up again.".into());
+                // Max iterations in background — ask the LLM to wrap up
+                messages.push(Message::user(
+                    "You've reached the maximum number of iterations for this \
+                     background task. Summarise what you accomplished and what \
+                     remains. Be concise and natural."
+                ));
+                let wrap_up = llm.complete(&messages).await?;
+                return Ok(wrap_up.text);
             }
 
             let response = if tool_defs.is_empty() {
