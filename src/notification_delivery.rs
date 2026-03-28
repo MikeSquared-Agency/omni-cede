@@ -172,15 +172,29 @@ async fn deliver_for_session(
         format!("## Your identity\n{}\n\n", persona)
     };
 
+    // Pull the full body of linked BackgroundTask nodes for richer context.
+    let bg_bodies = fetch_background_task_bodies(db, notifications).await;
+    let bg_context = if bg_bodies.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Full background task results\n{}\n", bg_bodies.join("\n---\n"))
+    };
+
     let system_prompt = format!(
         "{persona_section}\
          You are following up on background work you kicked off earlier. \
          The following tasks have completed:\n\n{notification_block}\n\
+         {bg_context}\n\
          Write a brief, natural message to let the user know what happened. \
          Be conversational and concise — this is a proactive update, not a \
          formal report. If something failed, mention it clearly but calmly. \
          Do NOT say \"notification\" or refer to yourself as a system. \
-         Stay in character.",
+         Stay in character.\n\n\
+         IMPORTANT: If the task results are vague, empty, or contain no \
+         concrete information worth sharing (e.g. just a generic completion \
+         message with no real content), respond with exactly [SKIP] and \
+         nothing else. Only send a message when you have something \
+         genuinely useful to tell the user.",
     );
 
     let messages = vec![
@@ -190,10 +204,17 @@ async fn deliver_for_session(
 
     // 3. Brief LLM call to formulate the message
     let response = llm.complete(&messages).await?;
-    let reply_text = response.text;
+    let reply_text = response.text.trim().to_string();
 
-    if reply_text.is_empty() {
-        tracing::warn!(session_id = %session_id, "LLM returned empty notification delivery text");
+    if reply_text.is_empty() || reply_text == "[SKIP]" {
+        tracing::info!(
+            session_id = %session_id,
+            count = notifications.len(),
+            "notification delivery skipped (no substantive content)"
+        );
+        // Still mark as delivered so we don't keep retrying
+        db.call(move |conn| queries::touch_nodes(conn, &delivered_ids))
+            .await?;
         return Ok(());
     }
 
@@ -221,4 +242,35 @@ async fn deliver_for_session(
         .await?;
 
     Ok(())
+}
+
+/// Follow DerivesFrom edges from notification nodes to their BackgroundTask
+/// nodes and collect the full bodies. This gives the delivery LLM richer
+/// context than the truncated notification summary alone.
+async fn fetch_background_task_bodies(db: &Db, notifications: &[Node]) -> Vec<String> {
+    let mut bodies = Vec::new();
+    for notif in notifications {
+        let nid = notif.id.clone();
+        if let Ok(edges) = db
+            .call(move |conn| queries::get_edges_from(conn, &nid))
+            .await
+        {
+            for edge in edges {
+                if edge.kind == EdgeKind::DerivesFrom {
+                    let target_id = edge.dst.clone();
+                    if let Ok(Some(node)) = db
+                        .call(move |conn| queries::get_node(conn, &target_id))
+                        .await
+                    {
+                        if node.kind == NodeKind::BackgroundTask {
+                            if let Some(body) = &node.body {
+                                bodies.push(body.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bodies
 }
