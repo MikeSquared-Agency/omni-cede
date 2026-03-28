@@ -56,6 +56,12 @@ impl ChannelRegistry {
         self.inbound_rx.take()
     }
 
+    /// Clone the inbound sender. Used by the notification delivery loop to
+    /// inject synthetic messages into the pipeline.
+    pub fn clone_inbound_tx(&self) -> mpsc::Sender<InboundEnvelope> {
+        self.inbound_tx.clone()
+    }
+
     /// Start all registered channels.
     ///
     /// Each channel receives its own [`ChannelContext`] with a cloned

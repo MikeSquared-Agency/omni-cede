@@ -265,27 +265,19 @@ pub async fn run() -> crate::error::Result<()> {
 
                 // ── Start event-driven notification delivery loop ──
                 {
-                    let notif_pipeline = std::sync::Arc::clone(&state.pipeline);
                     let notif_db = state.cx.db.clone();
-                    let notif_llm = state.agent.llm.clone();
-                    let notif_embed = state.cx.embed.clone();
-                    let notif_hnsw = state.cx.hnsw.clone();
-                    let notif_config = state.cx.config.clone();
+                    let notif_inbound_tx = state.registry.clone_inbound_tx();
                     let notif_shutdown = state.cx.shutdown_rx();
                     tokio::spawn(async move {
                         crate::notification_delivery::run(
                             notif_db,
-                            notif_pipeline,
-                            notif_llm,
-                            notif_embed,
-                            notif_hnsw,
-                            notif_config,
+                            notif_inbound_tx,
                             notif_shutdown,
                             notif_rx,
                         )
                         .await;
                     });
-                    println!("  Notification delivery: event-driven");
+                    println!("  Notification delivery: pipeline injection");
                 }
             }
 
