@@ -287,6 +287,7 @@ impl Channel for DiscordChannel {
                                     callback_url: None,
                                     raw: serde_json::Value::Null,
                                     timestamp: now_unix(),
+                                    is_proactive: false,
                                 };
 
                                 if let Err(e) = inbound_tx.send(envelope).await {

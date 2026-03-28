@@ -681,6 +681,7 @@ pub async fn run() -> crate::error::Result<()> {
                     sender_name: None,
                     user_id: "local".to_string(),
                     is_group: false,
+                    is_proactive: false,
                 };
                 match agent.run_turn(&session_id, input, &cli_ctx, None).await {
                     Ok(response) => println!("\n{response}\n"),

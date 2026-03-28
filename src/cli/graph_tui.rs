@@ -597,6 +597,7 @@ pub async fn run_with_chat(
                                             sender_name: None,
                                             user_id: "local".to_string(),
                                             is_group: false,
+                                            is_proactive: false,
                                         };
                                         tokio::spawn(async move {
                                             match agent_c.run_turn(&sid, &input, &cli_ctx, None).await {

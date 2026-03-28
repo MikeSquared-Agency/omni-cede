@@ -129,11 +129,12 @@ async fn inject_for_event(
     // 4. Build a synthetic InboundEnvelope
     //    The text is a minimal trigger — the agent's "Updates while you were
     //    away" section will pick up the actual notification content.
-    let envelope = InboundEnvelope::new(
+    let mut envelope = InboundEnvelope::new(
         &channel,
         &external_id,
         "[background tasks completed]",
     );
+    envelope.is_proactive = true;
 
     // 5. Inject into the pipeline's inbound channel
     if let Err(e) = inbound_tx.send(envelope).await {
