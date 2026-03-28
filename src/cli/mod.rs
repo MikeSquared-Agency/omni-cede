@@ -122,6 +122,14 @@ pub async fn run() -> crate::error::Result<()> {
         Commands::Serve { host, port } => {
             let llm = build_llm_client(&ollama_spec)?;
             cx.set_llm(llm.clone()).await;
+            // Create the event-driven notification channel
+            let (notif_tx, notif_rx) = tokio::sync::mpsc::unbounded_channel::<
+                crate::notification_delivery::NotifEvent,
+            >();
+
+            // Start the cron scheduler with the notif_tx channel
+            cx.start_scheduler(Some(notif_tx.clone()));
+
             let agent = crate::agent::orchestrator::Agent {
                 db: cx.db.clone(),
                 embed: cx.embed.clone(),
@@ -137,6 +145,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.config.clone(),
                 ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
+                notif_tx: Some(notif_tx.clone()),
             };
 
             let api_key = std::env::var("API_KEY").ok();
@@ -247,13 +256,14 @@ pub async fn run() -> crate::error::Result<()> {
                         state.cx.config.clone(),
                     ).await,
                     auto_link_tx: state.cx.auto_link_tx.clone(),
+                    notif_tx: Some(notif_tx.clone()),
                 });
                 tokio::spawn(async move {
                     pipeline_clone.run_inbound_loop(rx, db_clone, agent_clone).await;
                 });
                 println!("  Pipeline inbound loop: started");
 
-                // ── Start proactive notification delivery loop ──
+                // ── Start event-driven notification delivery loop ──
                 {
                     let notif_pipeline = std::sync::Arc::clone(&state.pipeline);
                     let notif_db = state.cx.db.clone();
@@ -271,11 +281,11 @@ pub async fn run() -> crate::error::Result<()> {
                             notif_hnsw,
                             notif_config,
                             notif_shutdown,
-                            10, // check every 10 seconds
+                            notif_rx,
                         )
                         .await;
                     });
-                    println!("  Notification delivery loop: started");
+                    println!("  Notification delivery: event-driven");
                 }
             }
 
@@ -434,6 +444,7 @@ pub async fn run() -> crate::error::Result<()> {
                                 cx.config.clone(),
                             ).await,
                             auto_link_tx: cx.auto_link_tx.clone(),
+                            notif_tx: None,
                         };
 
                         // Create session for the TUI chat
@@ -647,6 +658,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.config.clone(),
                 ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
+                notif_tx: None,
             };
 
             // Create a single session for the entire chat
@@ -704,6 +716,7 @@ pub async fn run() -> crate::error::Result<()> {
                     cx.config.clone(),
                 ).await,
                 auto_link_tx: cx.auto_link_tx.clone(),
+                notif_tx: None,
             };
 
             match agent.run(&query).await {

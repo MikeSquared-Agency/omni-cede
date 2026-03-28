@@ -1229,6 +1229,7 @@ pub fn builtin_registry_core(
                             llm: bg_llm,
                             tools: bg_tools,
                             auto_link_tx: bg_auto_link_tx.clone(),
+                            notif_tx: None,
                         };
 
                         let result = agent.run(&full_task).await;

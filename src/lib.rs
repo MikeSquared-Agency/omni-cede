@@ -285,29 +285,41 @@ impl CortexEmbedded {
             }
         });
 
-        // Cron scheduler task
-        {
-            let db = self.db.clone();
-            let embed = self.embed.clone();
-            let hnsw = self.hnsw.clone();
-            let auto_link_tx = self.auto_link_tx.clone();
-            let llm = self.llm.clone();
-            let config = self.config.clone();
+        // NOTE: Cron scheduler is started separately via start_scheduler()
+        // so the caller can pass in a NotifTx for event-driven delivery.
+        // (The shutdown_rx is consumed there instead.)
+    }
 
-            tokio::spawn(async move {
-                scheduler::run(
-                    db,
-                    embed,
-                    hnsw,
-                    auto_link_tx,
-                    llm,
-                    config,
-                    shutdown_rx,
-                    30, // check every 30 seconds
-                )
-                .await;
-            });
-        }
+    /// Start the cron scheduler as a background task.
+    ///
+    /// Called from the Serve command after the `NotifTx` channel is created,
+    /// so cron results can trigger immediate event-driven notification delivery.
+    pub fn start_scheduler(
+        &self,
+        notif_tx: Option<notification_delivery::NotifTx>,
+    ) {
+        let db = self.db.clone();
+        let embed = self.embed.clone();
+        let hnsw = self.hnsw.clone();
+        let auto_link_tx = self.auto_link_tx.clone();
+        let llm = self.llm.clone();
+        let config = self.config.clone();
+        let shutdown_rx = self.shutdown_rx();
+
+        tokio::spawn(async move {
+            scheduler::run(
+                db,
+                embed,
+                hnsw,
+                auto_link_tx,
+                llm,
+                config,
+                shutdown_rx,
+                30, // check every 30 seconds
+                notif_tx,
+            )
+            .await;
+        });
     }
 }
 

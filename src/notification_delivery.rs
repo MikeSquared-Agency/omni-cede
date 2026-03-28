@@ -1,11 +1,9 @@
-//! Proactive notification delivery — timer-based background loop.
+//! Event-driven notification delivery.
 //!
-//! When background tool execution completes, the result is stored as a
-//! `Notification` graph node linked to the user's session. This module runs
-//! a periodic loop that detects undelivered notifications, formulates a
-//! natural message via a brief LLM call, and pushes it proactively to the
-//! user's channel — so the user doesn't have to send another message to
-//! see the results.
+//! When background tool execution or a cron job completes, the producer
+//! creates a `Notification` graph node and fires a [`NotifEvent`] on a
+//! tokio mpsc channel. This module awaits that channel and delivers the
+//! notification immediately — no polling.
 //!
 //! The delivery LLM receives the same full briefing (identity, knowledge,
 //! recent conversation) as the main agent — no opinionated rules. It reads
@@ -15,9 +13,9 @@
 //! # Flow
 //!
 //! ```text
-//!   tick (every N seconds)
-//!     → query sessions with pending notifications
-//!     → for each: resolve outbound routing (channel + external_id)
+//!   NotifEvent received on mpsc channel
+//!     → query pending notifications for that session
+//!     → resolve outbound routing (channel + external_id)
 //!     → build full briefing (same as main agent)
 //!     → LLM call to formulate a natural follow-up message
 //!     → Pipeline::send_outbound() to push it to the user
@@ -39,12 +37,22 @@ use crate::llm::LlmClient;
 use crate::memory;
 use crate::types::*;
 
-/// Run the notification delivery loop until shutdown is signalled.
+/// Lightweight signal fired when a Notification node is created.
+#[derive(Debug, Clone)]
+pub struct NotifEvent {
+    /// The session node_id the notification is linked to.
+    pub session_id: String,
+}
+
+/// Sender half — cloned into every producer (Agent, scheduler).
+pub type NotifTx = tokio::sync::mpsc::UnboundedSender<NotifEvent>;
+/// Receiver half — owned by the delivery loop.
+pub type NotifRx = tokio::sync::mpsc::UnboundedReceiver<NotifEvent>;
+
+/// Run the event-driven notification delivery loop until shutdown.
 ///
-/// Checks for pending notification nodes every `interval_secs` seconds.
-/// When found, resolves outbound routing, builds a full briefing (same as
-/// the main agent), runs an LLM call to produce a natural message, and
-/// sends it via the pipeline.
+/// Awaits [`NotifEvent`]s on the mpsc channel. When one arrives, queries
+/// the session for pending notification nodes and delivers them immediately.
 pub async fn run(
     db: Db,
     pipeline: Arc<Pipeline>,
@@ -53,19 +61,19 @@ pub async fn run(
     hnsw: Arc<RwLock<VectorIndex>>,
     config: Config,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    interval_secs: u64,
+    mut rx: NotifRx,
 ) {
-    let interval = std::time::Duration::from_secs(interval_secs);
-    let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await; // skip the first immediate tick
-
-    tracing::info!(interval_secs, "notification delivery loop started");
+    tracing::info!("event-driven notification delivery loop started");
 
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                if let Err(e) = deliver_pending(&db, &pipeline, &llm, &embed, &hnsw, &config).await {
-                    tracing::warn!(error = %e, "notification delivery tick failed");
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    tracing::info!("notification channel closed — shutting down");
+                    break;
+                };
+                if let Err(e) = deliver_for_event(&db, &pipeline, &llm, &embed, &hnsw, &config, &event.session_id).await {
+                    tracing::warn!(session_id = %event.session_id, error = %e, "notification delivery failed");
                 }
             }
             _ = shutdown_rx.changed() => {
@@ -76,40 +84,43 @@ pub async fn run(
     }
 }
 
-/// One tick: find all sessions with pending notifications and deliver them.
-async fn deliver_pending(
+/// Handle a single event: look up routing info, fetch pending nodes, deliver.
+async fn deliver_for_event(
     db: &Db,
     pipeline: &Arc<Pipeline>,
     llm: &Arc<dyn LlmClient>,
     embed: &EmbedHandle,
     hnsw: &Arc<RwLock<VectorIndex>>,
     config: &Config,
+    session_id: &str,
 ) -> crate::error::Result<()> {
-    // Query all sessions that have undelivered notification nodes.
-    let sessions_with_notifs = db
-        .call(|conn| queries::get_sessions_with_pending_notifications(conn))
+    // 1. Fetch pending notification nodes for this session
+    let sid = session_id.to_string();
+    let notifications = db
+        .call(move |conn| queries::get_pending_notification_nodes(conn, &sid))
         .await?;
-
-    if sessions_with_notifs.is_empty() {
+    if notifications.is_empty() {
+        // Already claimed by the inline "Updates while you were away" path
         return Ok(());
     }
 
-    for (user_id, channel, session_id, notifications) in sessions_with_notifs {
-        if let Err(e) = deliver_for_session(
-            db, pipeline, llm, embed, hnsw, config,
-            &user_id, &channel, &session_id, &notifications,
-        ).await {
-            tracing::warn!(
-                user_id = %user_id,
-                channel = %channel,
-                session_id = %session_id,
-                error = %e,
-                "failed to deliver notifications for session"
-            );
+    // 2. Look up (user_id, channel) from managed_sessions
+    let sid2 = session_id.to_string();
+    let routing = db
+        .call(move |conn| queries::get_session_routing(conn, &sid2))
+        .await?;
+    let (user_id, channel) = match routing {
+        Some((uid, ch)) => (uid, ch),
+        None => {
+            tracing::warn!(session_id = %session_id, "no managed_session routing — cannot deliver");
+            return Ok(());
         }
-    }
+    };
 
-    Ok(())
+    deliver_for_session(
+        db, pipeline, llm, embed, hnsw, config,
+        &user_id, &channel, session_id, &notifications,
+    ).await
 }
 
 /// Deliver all pending notifications for a single session.

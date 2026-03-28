@@ -14,6 +14,7 @@ use crate::hnsw::VectorIndex;
 use crate::llm::LlmClient;
 use crate::memory;
 use crate::memory::format_timestamp;
+use crate::notification_delivery::{NotifEvent, NotifTx};
 use crate::tools::ToolRegistry;
 use crate::types::*;
 
@@ -32,6 +33,9 @@ pub struct Agent {
     pub llm: Arc<dyn LlmClient>,
     pub tools: ToolRegistry,
     pub auto_link_tx: async_channel::Sender<NodeId>,
+    /// Channel for event-driven notification delivery.
+    /// `None` in CLI/TUI mode where proactive delivery is not available.
+    pub notif_tx: Option<NotifTx>,
 }
 
 impl Agent {
@@ -589,6 +593,7 @@ impl Agent {
                 let tool_defs = self.tools.anthropic_tool_defs();
                 let tools = self.tools.clone();
                 let auto_link_tx = self.auto_link_tx.clone();
+                let notif_tx = self.notif_tx.clone();
                 let session_id = session_id.to_string();
                 let panic_session = session_id.clone();
                 let pending_calls: Vec<ToolCall> = response.tool_calls.clone();
@@ -663,6 +668,11 @@ impl Agent {
                         tracing::error!("Failed to link notification to bg task: {e}");
                     }
 
+                    // Fire event for immediate delivery
+                    if let Some(ref tx) = notif_tx {
+                        let _ = tx.send(NotifEvent { session_id: session_id.clone() });
+                    }
+
                     if let Err(e) = &result {
                         tracing::error!("Background tool loop failed: {e}");
                     }
@@ -671,6 +681,7 @@ impl Agent {
                 // Monitor for panics in a secondary task
                 let panic_db = self.db.clone();
                 let panic_sid = panic_session.clone();
+                let panic_notif_tx = self.notif_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle.await {
                         tracing::error!("Background task panicked: {e}");
@@ -682,8 +693,12 @@ impl Agent {
                             let n = notif_node;
                             move |conn| queries::insert_node(conn, &n)
                         }).await;
-                        let edge = Edge::new(notif_id, panic_sid, EdgeKind::PartOf);
+                        let edge = Edge::new(notif_id, panic_sid.clone(), EdgeKind::PartOf);
                         let _ = panic_db.call(move |conn| queries::insert_edge(conn, &edge)).await;
+                        // Fire event for immediate delivery
+                        if let Some(ref tx) = panic_notif_tx {
+                            let _ = tx.send(NotifEvent { session_id: panic_sid });
+                        }
                     }
                 });
 

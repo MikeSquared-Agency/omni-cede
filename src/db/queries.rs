@@ -721,36 +721,22 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
 
 // ─── Notification nodes (graph-native) ──────────────────
 
-/// Return all sessions that have at least one undelivered notification.
-///
-/// Each entry is `(user_id, channel, session_node_id, Vec<Node>)`.
-/// Used by the proactive notification delivery loop.
-pub fn get_sessions_with_pending_notifications(
+/// Look up the (user_id, channel) for a managed session.
+pub fn get_session_routing(
     conn: &Connection,
-) -> Result<Vec<(String, String, String, Vec<Node>)>> {
-    // First, find all (session_id, user_id, channel) tuples that have pending notifications
-    let mut session_stmt = conn.prepare(
-        "SELECT DISTINCT ms.node_id, ms.user_id, ms.channel
-         FROM managed_sessions ms
-         JOIN edges e ON e.dst = ms.node_id AND e.kind = 'part_of'
-         JOIN nodes n ON n.id = e.src
-         WHERE n.kind = 'notification' AND n.access_count = 0",
+    session_id: &str,
+) -> Result<Option<(String, String)>> {
+    crate::session::create_tables(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT user_id, channel FROM managed_sessions WHERE node_id = ?1",
     )?;
-    let sessions: Vec<(String, String, String)> = session_stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let mut result = Vec::new();
-    for (session_id, user_id, channel) in sessions {
-        let nodes = get_pending_notification_nodes(conn, &session_id)?;
-        if !nodes.is_empty() {
-            result.push((user_id, channel, session_id, nodes));
-        }
+    let mut rows = stmt.query_map(params![session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    match rows.next() {
+        Some(Ok(pair)) => Ok(Some(pair)),
+        _ => Ok(None),
     }
-    Ok(result)
 }
 
 /// Fetch all undelivered Notification nodes linked to a session, oldest first.

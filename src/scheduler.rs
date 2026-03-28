@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::hnsw::VectorIndex;
 use crate::llm::LlmClient;
 use crate::memory::format_timestamp;
+use crate::notification_delivery::{NotifEvent, NotifTx};
 use crate::types::*;
 
 /// Metadata stored in a CronJob node's body (JSON).
@@ -58,6 +59,7 @@ pub async fn run(
     config: Config,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     tick_secs: u64,
+    notif_tx: Option<NotifTx>,
 ) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
     ticker.tick().await; // skip the first immediate tick
@@ -65,7 +67,7 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Err(e) = tick(&db, &embed, &hnsw, &auto_link_tx, &llm, &config).await {
+                if let Err(e) = tick(&db, &embed, &hnsw, &auto_link_tx, &llm, &config, &notif_tx).await {
                     tracing::warn!("scheduler tick error: {e}");
                 }
             }
@@ -85,6 +87,7 @@ async fn tick(
     auto_link_tx: &async_channel::Sender<NodeId>,
     llm: &Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     config: &Config,
+    notif_tx: &Option<NotifTx>,
 ) -> Result<()> {
     // 1. Load all CronJob nodes
     let cron_nodes = db
@@ -186,6 +189,7 @@ async fn tick(
             meta.max_iterations,
             meta.user_id.clone(),
             meta.channel.clone(),
+            notif_tx.clone(),
         );
     }
 
@@ -206,6 +210,7 @@ fn fire_cron_job(
     max_iterations: usize,
     user_id: Option<String>,
     channel: Option<String>,
+    notif_tx: Option<NotifTx>,
 ) {
     tokio::spawn(async move {
         // 1. Create a CronExecution node
@@ -250,6 +255,7 @@ fn fire_cron_job(
             llm,
             tools,
             auto_link_tx: auto_link_tx.clone(),
+            notif_tx: None, // cron agent doesn't trigger event-driven delivery itself
         };
 
         // 4. Run the agent loop
@@ -317,10 +323,14 @@ fn fire_cron_job(
                         move |conn| queries::insert_node(conn, &n)
                     })
                     .await;
-                let notif_edge = Edge::new(notif_id, sid, EdgeKind::PartOf);
+                let notif_edge = Edge::new(notif_id, sid.clone(), EdgeKind::PartOf);
                 let _ = db
                     .call(move |conn| queries::insert_edge(conn, &notif_edge))
                     .await;
+                // Fire event for immediate delivery
+                if let Some(ref tx) = notif_tx {
+                    let _ = tx.send(NotifEvent { session_id: sid });
+                }
                 tracing::info!(
                     user_id = %uid.as_str(),
                     channel = %ch.as_str(),
