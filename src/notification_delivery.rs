@@ -125,6 +125,42 @@ async fn deliver_for_session(
     session_id: &str,
     notifications: &[Node],
 ) -> crate::error::Result<()> {
+    // ── Guard: skip proactive delivery if the session is active ─────
+    // If the user sent a message in the last 30 seconds, the main agent's
+    // "Updates while you were away" will handle these notifications inline.
+    // This prevents the race where both paths pick up the same notifications.
+    {
+        let sid = session_id.to_string();
+        let recent = db
+            .call(move |conn| queries::get_recent_session_nodes(conn, &sid, 1))
+            .await
+            .unwrap_or_default();
+        if let Some(latest) = recent.first() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let age_secs = now - latest.created_at;
+            if age_secs < 30 {
+                tracing::debug!(
+                    session_id = %session_id,
+                    age_secs,
+                    "session active — deferring notification to main agent"
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // ── Claim notifications immediately ─────────────────────────────
+    // Mark as delivered (access_count 0 → 1) BEFORE the LLM call so the
+    // main agent's run_turn won't also pick them up during the race window.
+    let delivered_ids: Vec<String> = notifications.iter().map(|n| n.id.clone()).collect();
+    {
+        let ids = delivered_ids.clone();
+        db.call(move |conn| queries::touch_nodes(conn, &ids)).await?;
+    }
+
     // 1. Resolve outbound routing: channel + external_id
     let uid = user_id.to_string();
     let ch = channel.to_string();
@@ -209,12 +245,10 @@ async fn deliver_for_session(
 
     // 4. Append notification / background task results
     let mut notification_block = String::new();
-    let mut delivered_ids: Vec<String> = Vec::new();
     for node in notifications {
         let rel = memory::relative_time(node.created_at);
         let body = node.body.as_deref().unwrap_or(&node.title);
         notification_block.push_str(&format!("- ({}) {}\n", rel, body));
-        delivered_ids.push(node.id.clone());
     }
 
     // Pull the full body of linked BackgroundTask nodes for richer context.
@@ -264,9 +298,7 @@ async fn deliver_for_session(
             count = notifications.len(),
             "notification delivery skipped (LLM decided nothing to send)"
         );
-        // Still mark as delivered so we don't keep retrying
-        db.call(move |conn| queries::touch_nodes(conn, &delivered_ids))
-            .await?;
+        // Already claimed at the top — nothing more to do
         return Ok(());
     }
 
@@ -289,9 +321,7 @@ async fn deliver_for_session(
         "proactive notifications delivered"
     );
 
-    // 8. Mark notifications as delivered (bump access_count from 0)
-    db.call(move |conn| queries::touch_nodes(conn, &delivered_ids))
-        .await?;
+    // Already claimed at the top — no need to touch again
 
     Ok(())
 }
