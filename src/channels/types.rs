@@ -43,6 +43,10 @@ pub struct InboundEnvelope {
     pub raw: serde_json::Value,
     /// Unix timestamp (seconds) when the message was received.
     pub timestamp: i64,
+    /// True when this envelope was injected synthetically (e.g. notification
+    /// delivery) rather than originating from a real user message.
+    #[serde(default)]
+    pub is_proactive: bool,
 }
 
 impl InboundEnvelope {
@@ -59,6 +63,7 @@ impl InboundEnvelope {
             callback_url: None,
             raw: serde_json::Value::Null,
             timestamp: now_unix(),
+            is_proactive: false,
         }
     }
 }

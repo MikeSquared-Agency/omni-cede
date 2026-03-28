@@ -103,6 +103,7 @@ impl Pipeline {
             sender_name: envelope.sender_name.clone().or(user.display_name.clone()),
             user_id: user.id.clone(),
             is_group: envelope.group_id.is_some(),
+            is_proactive: envelope.is_proactive,
         };
 
         let mut reply = agent
@@ -176,6 +177,7 @@ impl Pipeline {
             sender_name: envelope.sender_name.clone().or(user.display_name.clone()),
             user_id: user.id.clone(),
             is_group: envelope.group_id.is_some(),
+            is_proactive: envelope.is_proactive,
         };
 
         let mut reply = agent
