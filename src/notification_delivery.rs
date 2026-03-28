@@ -125,36 +125,9 @@ async fn deliver_for_session(
     session_id: &str,
     notifications: &[Node],
 ) -> crate::error::Result<()> {
-    // ── Guard: skip proactive delivery if the session is active ─────
-    // If the user sent a message in the last 30 seconds, the main agent's
-    // "Updates while you were away" will handle these notifications inline.
-    // This prevents the race where both paths pick up the same notifications.
-    {
-        let sid = session_id.to_string();
-        let recent = db
-            .call(move |conn| queries::get_recent_session_nodes(conn, &sid, 1))
-            .await
-            .unwrap_or_default();
-        if let Some(latest) = recent.first() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let age_secs = now - latest.created_at;
-            if age_secs < 30 {
-                tracing::debug!(
-                    session_id = %session_id,
-                    age_secs,
-                    "session active — deferring notification to main agent"
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    // ── Claim notifications immediately ─────────────────────────────
-    // Mark as delivered (access_count 0 → 1) BEFORE the LLM call so the
-    // main agent's run_turn won't also pick them up during the race window.
+    // Claim notifications immediately — whoever reads first, wins.
+    // This closes the race window between the proactive delivery loop
+    // and the main agent's "Updates while you were away" path.
     let delivered_ids: Vec<String> = notifications.iter().map(|n| n.id.clone()).collect();
     {
         let ids = delivered_ids.clone();
@@ -298,7 +271,6 @@ async fn deliver_for_session(
             count = notifications.len(),
             "notification delivery skipped (LLM decided nothing to send)"
         );
-        // Already claimed at the top — nothing more to do
         return Ok(());
     }
 
@@ -320,8 +292,6 @@ async fn deliver_for_session(
         count = notifications.len(),
         "proactive notifications delivered"
     );
-
-    // Already claimed at the top — no need to touch again
 
     Ok(())
 }
