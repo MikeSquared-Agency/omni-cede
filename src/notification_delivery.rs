@@ -180,8 +180,34 @@ async fn deliver_for_session(
         format!("\n## Full background task results\n{}\n", bg_bodies.join("\n---\n"))
     };
 
+    // Pull recent conversation so the notification LLM knows what was
+    // already said and can skip redundant updates or blend naturally.
+    let sid = session_id.to_string();
+    let recent_nodes = db
+        .call(move |conn| queries::get_recent_session_nodes(conn, &sid, 10))
+        .await
+        .unwrap_or_default();
+
+    let mut conversation_block = String::new();
+    if !recent_nodes.is_empty() {
+        conversation_block.push_str("## Recent conversation (what was already said)\n");
+        for node in recent_nodes.iter().rev() {
+            let label = match node.kind {
+                NodeKind::UserInput => "User",
+                NodeKind::ToolCall => "Tool",
+                NodeKind::BackgroundTask => "Background",
+                _ => "Assistant",
+            };
+            let body = node.body.as_deref().unwrap_or(&node.title);
+            let rel = memory::relative_time(node.created_at);
+            conversation_block.push_str(&format!("- ({rel}) {label}: {body}\n"));
+        }
+        conversation_block.push('\n');
+    }
+
     let system_prompt = format!(
         "{persona_section}\
+         {conversation_block}\
          You are following up on background work you kicked off earlier. \
          The following tasks have completed:\n\n{notification_block}\n\
          {bg_context}\n\
@@ -190,11 +216,16 @@ async fn deliver_for_session(
          formal report. If something failed, mention it clearly but calmly. \
          Do NOT say \"notification\" or refer to yourself as a system. \
          Stay in character.\n\n\
-         IMPORTANT: If the task results are vague, empty, or contain no \
-         concrete information worth sharing (e.g. just a generic completion \
-         message with no real content), respond with exactly [SKIP] and \
-         nothing else. Only send a message when you have something \
-         genuinely useful to tell the user.",
+         CRITICAL RULES:\n\
+         1. Read the recent conversation above carefully. If the user ALREADY \
+            knows about this result (because you discussed it, acknowledged it, \
+            or the topic was covered), respond with exactly [SKIP].\n\
+         2. Do NOT repeat, paraphrase, or re-announce anything already said.\n\
+         3. If sending a message, it must contain NEW information the user \
+            hasn't seen yet. Blend naturally into the ongoing conversation.\n\
+         4. If the task results are vague, empty, or contain no concrete \
+            information worth sharing, respond with exactly [SKIP].\n\
+         5. Match the tone and energy of the recent conversation.",
     );
 
     let messages = vec![
