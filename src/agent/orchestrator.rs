@@ -407,6 +407,13 @@ impl Agent {
                 "## Current conversation\nYou are talking to **{}** via **{}** ({}).\n\n",
                 sender, ctx.channel, where_str,
             ));
+            context_doc.push_str(
+                "When you need to use tools to fulfil a request, always include a brief, \
+                 natural acknowledgment in your response text so the user knows you're on it. \
+                 Keep it short and human — e.g. \"Let me look into that\" or \"Sure, one sec.\" \
+                 Your background workers will handle the tools and you'll be briefed on the \
+                 results, which will then be proactively sent to the user.\n\n",
+            );
         }
 
         // ── Pending notifications (background task results) ─
@@ -517,10 +524,12 @@ impl Agent {
             }
             StopReason::ToolUse => {
                 // ── Return immediately, spawn tool execution in background ──
+                // Use the LLM's own natural acknowledgment text. If it sent
+                // tool calls with no accompanying text, provide a brief default.
                 let immediate_reply = if response.text.is_empty() {
-                    "On it — I'll work on this in the background and let you know when it's done.".to_string()
+                    "On it.".to_string()
                 } else {
-                    format!("{}\n\n_(Working on this in the background — I'll let you know when it's done.)_", response.text)
+                    response.text.clone()
                 };
 
                 // Clone everything needed for the background task

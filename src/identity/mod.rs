@@ -140,6 +140,22 @@ pub fn link_channel(
     Ok(())
 }
 
+/// Look up the external_id for a user on a specific channel.
+///
+/// Returns `None` if no mapping exists for that (user, channel) pair.
+pub fn get_external_id(
+    conn: &Connection,
+    user_id: &str,
+    channel: &str,
+) -> std::result::Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT external_id FROM channel_mappings WHERE user_id = ?1 AND channel = ?2",
+        params![user_id, channel],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// List all channel identifiers for a user.
 pub fn list_channels(
     conn: &Connection,

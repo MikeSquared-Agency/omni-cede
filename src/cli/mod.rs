@@ -252,6 +252,25 @@ pub async fn run() -> crate::error::Result<()> {
                     pipeline_clone.run_inbound_loop(rx, db_clone, agent_clone).await;
                 });
                 println!("  Pipeline inbound loop: started");
+
+                // ── Start proactive notification delivery loop ──
+                {
+                    let notif_pipeline = std::sync::Arc::clone(&state.pipeline);
+                    let notif_db = state.cx.db.clone();
+                    let notif_llm = state.agent.llm.clone();
+                    let notif_shutdown = state.cx.shutdown_rx();
+                    tokio::spawn(async move {
+                        crate::notification_delivery::run(
+                            notif_db,
+                            notif_pipeline,
+                            notif_llm,
+                            notif_shutdown,
+                            10, // check every 10 seconds
+                        )
+                        .await;
+                    });
+                    println!("  Notification delivery loop: started");
+                }
             }
 
             let listener = tokio::net::TcpListener::bind(&addr)

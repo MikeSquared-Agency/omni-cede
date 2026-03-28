@@ -15,6 +15,7 @@ pub mod identity;
 pub mod session;
 pub mod channels;
 pub mod scheduler;
+pub mod notification_delivery;
 #[cfg(feature = "browser")]
 pub mod browser;
 
@@ -107,6 +108,12 @@ impl CortexEmbedded {
     pub async fn set_llm(&self, client: Arc<dyn LlmClient>) {
         let mut guard = self.llm.write().await;
         *guard = Some(client);
+    }
+
+    /// Get a new shutdown receiver. Each receiver is independent —
+    /// used by components that need to know when to stop.
+    pub fn shutdown_rx(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
     }
 
     // ─── Core memory ────────────────────────────────────
