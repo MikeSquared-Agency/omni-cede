@@ -326,42 +326,45 @@ impl Agent {
         media: Option<&crate::channels::types::MediaPayload>,
     ) -> Result<String> {
         // 1. Store the user's input as a UserInput node in the graph
-        let now_ts = format_timestamp(crate::types::now_unix());
-        let user_node = Node::new(NodeKind::UserInput, format!("[{now_ts}] {input}"))
-            .with_body(input)
-            .with_importance(0.4)
-            .with_decay_rate(0.02);
-        let user_node_id = user_node.id.clone();
+        //    (skip for proactive notifications — there is no real user input)
+        if !ctx.is_proactive {
+            let now_ts = format_timestamp(crate::types::now_unix());
+            let user_node = Node::new(NodeKind::UserInput, format!("[{now_ts}] {input}"))
+                .with_body(input)
+                .with_importance(0.4)
+                .with_decay_rate(0.02);
+            let user_node_id = user_node.id.clone();
 
-        // Embed and store
-        let text = user_node.embed_text();
-        let embedding = self.embed.embed(&text).await?;
-        let embedding_blob = bytemuck::cast_slice::<f32, u8>(&embedding).to_vec();
-        let mut stored_node = user_node.clone();
-        stored_node.embedding = Some(embedding.clone());
+            // Embed and store
+            let text = user_node.embed_text();
+            let embedding = self.embed.embed(&text).await?;
+            let embedding_blob = bytemuck::cast_slice::<f32, u8>(&embedding).to_vec();
+            let mut stored_node = user_node.clone();
+            stored_node.embedding = Some(embedding.clone());
 
-        self.db
-            .call({
-                let mut n = stored_node.clone();
-                n.embedding = Some(bytemuck::cast_slice::<u8, f32>(&embedding_blob).to_vec());
-                move |conn| queries::insert_node(conn, &n)
-            })
-            .await?;
+            self.db
+                .call({
+                    let mut n = stored_node.clone();
+                    n.embedding = Some(bytemuck::cast_slice::<u8, f32>(&embedding_blob).to_vec());
+                    move |conn| queries::insert_node(conn, &n)
+                })
+                .await?;
 
-        // Insert into HNSW for future recall
-        {
-            let mut index = self.hnsw.write().await;
-            index.insert(user_node_id.clone(), embedding);
+            // Insert into HNSW for future recall
+            {
+                let mut index = self.hnsw.write().await;
+                index.insert(user_node_id.clone(), embedding);
+            }
+
+            // Link UserInput → Session
+            let edge = Edge::new(user_node_id.clone(), session_id.to_string(), EdgeKind::PartOf);
+            self.db
+                .call(move |conn| queries::insert_edge(conn, &edge))
+                .await?;
+
+            // Trigger auto-link (connects to related nodes)
+            let _ = self.auto_link_tx.try_send(user_node_id);
         }
-
-        // Link UserInput → Session
-        let edge = Edge::new(user_node_id.clone(), session_id.to_string(), EdgeKind::PartOf);
-        self.db
-            .call(move |conn| queries::insert_edge(conn, &edge))
-            .await?;
-
-        // Trigger auto-link (connects to related nodes)
-        let _ = self.auto_link_tx.try_send(user_node_id);
 
         // 2. Build a FRESH briefing using the input as semantic query
         let brief = memory::briefing_with_kinds(
@@ -426,13 +429,22 @@ impl Agent {
                 "## Current conversation\nYou are talking to **{}** via **{}** ({}).\n\n",
                 sender, ctx.channel, where_str,
             ));
-            context_doc.push_str(
-                "When you need to use tools to fulfil a request, always include a brief, \
-                 natural acknowledgment in your response text so the user knows you're on it. \
-                 Keep it short and human — e.g. \"Let me look into that\" or \"Sure, one sec.\" \
-                 Your background workers will handle the tools and you'll be briefed on the \
-                 results, which will then be proactively sent to the user.\n\n",
-            );
+            if ctx.is_proactive {
+                context_doc.push_str(
+                    "This is a **proactive follow-up** — the user has NOT sent a new message. \
+                     You are reaching out because background work has completed. \
+                     Get straight to the results. Do NOT greet the user or add preamble — \
+                     just deliver the update naturally and concisely.\n\n",
+                );
+            } else {
+                context_doc.push_str(
+                    "When you need to use tools to fulfil a request, always include a brief, \
+                     natural acknowledgment in your response text so the user knows you're on it. \
+                     Keep it short and human — e.g. \"Let me look into that\" or \"Sure, one sec.\" \
+                     Your background workers will handle the tools and you'll be briefed on the \
+                     results, which will then be proactively sent to the user.\n\n",
+                );
+            }
         }
 
         // ── Pending notifications (background task results) ─
@@ -443,7 +455,11 @@ impl Agent {
 
         if !pending.is_empty() {
             context_doc.push_str("## Updates while you were away\n");
-            context_doc.push_str("The following background tasks finished since your last message. Mention these to the user naturally:\n");
+            if ctx.is_proactive {
+                context_doc.push_str("The following background tasks finished. Present the results directly:\n");
+            } else {
+                context_doc.push_str("The following background tasks finished since your last message. Mention these to the user naturally:\n");
+            }
             let mut delivered_ids: Vec<String> = Vec::new();
             for node in &pending {
                 let rel = memory::relative_time(node.created_at);
@@ -461,7 +477,11 @@ impl Agent {
         }
 
         // 4. Build messages — just system + user (+ optional image), no history
-        let user_msg = if let Some(media) = media {
+        let user_msg = if ctx.is_proactive {
+            // For proactive turns, the "user" message is just a trigger for
+            // the agent to deliver the notification results.
+            Message::user("Deliver the background task results above.")
+        } else if let Some(media) = media {
             if media.kind == crate::channels::types::MediaKind::Image {
                 let b64 = base64_encode(&media.data);
                 Message::user_with_image(input, &b64, &media.mime_type)

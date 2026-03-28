@@ -274,6 +274,7 @@ impl Channel for TelegramChannel {
                                                             "message_id": msg.message_id,
                                                         }),
                                                         timestamp: now_unix(),
+                                                        is_proactive: false,
                                                     };
 
                                                     if inbound_tx.send(envelope).await.is_err()

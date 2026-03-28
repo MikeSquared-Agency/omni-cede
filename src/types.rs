@@ -561,6 +561,9 @@ pub struct TurnContext {
     pub user_id: String,
     /// True when the message came from a group/channel (not a DM).
     pub is_group: bool,
+    /// True when this turn was triggered by a proactive notification
+    /// injection, not a real user message.
+    pub is_proactive: bool,
 }
 
 // ─── Model backend ──────────────────────────────────────
