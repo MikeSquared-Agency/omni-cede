@@ -45,21 +45,11 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             value TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS notifications (
-            id              TEXT PRIMARY KEY,
-            session_id      TEXT NOT NULL,
-            summary         TEXT NOT NULL,
-            source_node_id  TEXT,
-            created_at      INTEGER NOT NULL,
-            delivered       INTEGER DEFAULT 0
-        );
-
         CREATE INDEX IF NOT EXISTS idx_nodes_kind       ON nodes(kind);
         CREATE INDEX IF NOT EXISTS idx_nodes_importance  ON nodes(importance DESC);
         CREATE INDEX IF NOT EXISTS idx_edges_src         ON edges(src);
         CREATE INDEX IF NOT EXISTS idx_edges_dst         ON edges(dst);
         CREATE INDEX IF NOT EXISTS idx_edges_kind        ON edges(kind);
-        CREATE INDEX IF NOT EXISTS idx_notif_session     ON notifications(session_id, delivered);
         ",
     )?;
     Ok(())

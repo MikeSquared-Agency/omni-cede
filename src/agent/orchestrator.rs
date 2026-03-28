@@ -412,24 +412,24 @@ impl Agent {
         // ── Pending notifications (background task results) ─
         let session_for_notif = session_id.to_string();
         let pending = self.db.call(move |conn| {
-            queries::get_pending_notifications(conn, &session_for_notif)
+            queries::get_pending_notification_nodes(conn, &session_for_notif)
         }).await?;
 
         if !pending.is_empty() {
             context_doc.push_str("## Updates while you were away\n");
             context_doc.push_str("The following background tasks finished since your last message. Mention these to the user naturally:\n");
             let mut delivered_ids: Vec<String> = Vec::new();
-            for notif in &pending {
-                let rel = memory::relative_time(notif.created_at);
-                context_doc.push_str(&format!("- ({}) {}\n", rel, notif.summary));
-                delivered_ids.push(notif.id.clone());
+            for node in &pending {
+                let rel = memory::relative_time(node.created_at);
+                context_doc.push_str(&format!("- ({}) {}\n", rel, node.title));
+                delivered_ids.push(node.id.clone());
             }
             context_doc.push('\n');
 
-            // Mark as delivered
+            // Mark as delivered (touch increments access_count from 0 to 1+)
             if !delivered_ids.is_empty() {
                 self.db.call(move |conn| {
-                    queries::mark_notifications_delivered(conn, &delivered_ids)
+                    queries::touch_nodes(conn, &delivered_ids)
                 }).await?;
             }
         }
@@ -583,16 +583,24 @@ impl Agent {
                     }
                     let _ = auto_link_tx.try_send(bg_id.clone());
 
-                    // Write notification so the user gets informed on next message
-                    let notif = Notification {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_id: session_id.clone(),
-                        summary: notif_summary,
-                        source_node_id: Some(bg_id),
-                        created_at: crate::types::now_unix(),
-                    };
-                    if let Err(e) = db.call(move |conn| queries::insert_notification(conn, &notif)).await {
-                        tracing::error!("Failed to write notification: {e}");
+                    // Write notification node so the user gets informed on next message
+                    let notif_node = Node::notification(&notif_summary);
+                    let notif_id = notif_node.id.clone();
+                    if let Err(e) = db.call({
+                        let n = notif_node;
+                        move |conn| queries::insert_node(conn, &n)
+                    }).await {
+                        tracing::error!("Failed to write notification node: {e}");
+                    }
+                    // Link notification → session via PartOf
+                    let notif_edge = Edge::new(notif_id.clone(), session_id.clone(), EdgeKind::PartOf);
+                    if let Err(e) = db.call(move |conn| queries::insert_edge(conn, &notif_edge)).await {
+                        tracing::error!("Failed to link notification to session: {e}");
+                    }
+                    // Also link notification → background task node via DerivesFrom
+                    let derives = Edge::new(notif_id, bg_id, EdgeKind::DerivesFrom);
+                    if let Err(e) = db.call(move |conn| queries::insert_edge(conn, &derives)).await {
+                        tracing::error!("Failed to link notification to bg task: {e}");
                     }
 
                     if let Err(e) = &result {
@@ -602,17 +610,20 @@ impl Agent {
 
                 // Monitor for panics in a secondary task
                 let panic_db = self.db.clone();
+                let panic_sid = panic_session.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle.await {
                         tracing::error!("Background task panicked: {e}");
-                        let notif = Notification {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            session_id: panic_session,
-                            summary: "A background task crashed unexpectedly. You may want to retry.".to_string(),
-                            source_node_id: None,
-                            created_at: crate::types::now_unix(),
-                        };
-                        let _ = panic_db.call(move |conn| queries::insert_notification(conn, &notif)).await;
+                        let notif_node = Node::notification(
+                            "A background task crashed unexpectedly. You may want to retry.",
+                        );
+                        let notif_id = notif_node.id.clone();
+                        let _ = panic_db.call({
+                            let n = notif_node;
+                            move |conn| queries::insert_node(conn, &n)
+                        }).await;
+                        let edge = Edge::new(notif_id, panic_sid, EdgeKind::PartOf);
+                        let _ = panic_db.call(move |conn| queries::insert_edge(conn, &edge)).await;
                     }
                 });
 

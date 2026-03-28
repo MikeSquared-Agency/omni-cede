@@ -12,6 +12,7 @@ use crate::db::queries;
 use crate::embed::EmbedHandle;
 use crate::error::{CortexError, Result};
 use crate::hnsw::VectorIndex;
+use crate::memory::format_timestamp;
 use crate::types::*;
 
 /// A tool the agent can call. The handler is an async function that
@@ -85,9 +86,10 @@ impl ToolRegistry {
         let result = (tool.handler)(input.clone()).await?;
 
         // Write ToolCall node
+        let ts = format_timestamp(crate::types::now_unix());
         let tool_call_node = Node {
             kind: NodeKind::ToolCall,
-            title: format!("Used {name}"),
+            title: format!("[{ts}] Used {name}"),
             body: Some(serde_json::json!({
                 "tool": name,
                 "input": input,
@@ -95,7 +97,7 @@ impl ToolRegistry {
                 "success": result.success,
             }).to_string()),
             trust_score: trust as f64,
-            ..Node::new(NodeKind::ToolCall, format!("Used {name}"))
+            ..Node::new(NodeKind::ToolCall, format!("[{ts}] Used {name}"))
         };
         let tc_id = tool_call_node.id.clone();
         db.call({
@@ -179,16 +181,17 @@ impl ToolRegistry {
     ) -> Result<()> {
         let trust = self.get(name).map(|t| t.trust).unwrap_or(0.5);
 
+        let ts = format_timestamp(crate::types::now_unix());
         let tool_call_node = Node {
             kind: NodeKind::ToolCall,
-            title: format!("Used {name}"),
+            title: format!("[{ts}] Used {name}"),
             body: Some(serde_json::json!({
                 "tool": name,
                 "output": &result.output,
                 "success": result.success,
             }).to_string()),
             trust_score: trust as f64,
-            ..Node::new(NodeKind::ToolCall, format!("Used {name}"))
+            ..Node::new(NodeKind::ToolCall, format!("[{ts}] Used {name}"))
         };
         let tc_id = tool_call_node.id.clone();
         db.call({
@@ -201,7 +204,7 @@ impl ToolRegistry {
         db.call(move |conn| queries::insert_edge(conn, &edge)).await?;
 
         if result.success {
-            let fact = Node::new(NodeKind::Fact, format!("Output from {name}"))
+            let fact = Node::new(NodeKind::Fact, format!("[{ts}] Output from {name}"))
                 .with_body(&result.output)
                 .with_trust(trust as f64);
             let fact_id = fact.id.clone();
@@ -1186,7 +1189,7 @@ pub fn builtin_registry_core(
 
                     let task_node = Node::new(
                         NodeKind::BackgroundTask,
-                        format!("Working on: {}", &task),
+                        format!("[{}] Working on: {}", format_timestamp(crate::types::now_unix()), &task),
                     )
                     .with_body(&format!("Status: running\n\n{full_task}"))
                     .with_importance(0.6);

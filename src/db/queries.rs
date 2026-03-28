@@ -719,42 +719,39 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
     bytemuck::cast_slice::<u8, f32>(blob).to_vec()
 }
 
-// ─── Notifications ──────────────────────────────────────
+// ─── Notification nodes (graph-native) ──────────────────
 
-/// Insert a pending notification for a session.
-pub fn insert_notification(conn: &Connection, notif: &crate::types::Notification) -> Result<()> {
-    conn.execute(
-        "INSERT INTO notifications (id, session_id, summary, source_node_id, created_at, delivered)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-        params![
-            notif.id,
-            notif.session_id,
-            notif.summary,
-            notif.source_node_id,
-            notif.created_at,
-        ],
-    )?;
-    Ok(())
-}
-
-/// Fetch all undelivered notifications for a session, oldest first.
-pub fn get_pending_notifications(
+/// Fetch all undelivered Notification nodes linked to a session, oldest first.
+/// A notification is "undelivered" when access_count == 0.
+pub fn get_pending_notification_nodes(
     conn: &Connection,
     session_id: &str,
-) -> Result<Vec<crate::types::Notification>> {
+) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, summary, source_node_id, created_at
-         FROM notifications
-         WHERE session_id = ?1 AND delivered = 0
-         ORDER BY created_at ASC",
+        "SELECT n.id, n.kind, n.title, n.body, n.importance, n.trust_score,
+                n.access_count, n.created_at, n.last_access, n.decay_rate
+         FROM nodes n
+         JOIN edges e ON e.src = n.id
+         WHERE n.kind = 'notification'
+           AND n.access_count = 0
+           AND e.dst = ?1
+           AND e.kind = 'part_of'
+         ORDER BY n.created_at ASC",
     )?;
     let rows = stmt.query_map(params![session_id], |row| {
-        Ok(crate::types::Notification {
+        let kind_str: String = row.get(1)?;
+        Ok(Node {
             id: row.get(0)?,
-            session_id: row.get(1)?,
-            summary: row.get(2)?,
-            source_node_id: row.get(3)?,
-            created_at: row.get(4)?,
+            kind: NodeKind::from_str_opt(&kind_str).unwrap_or(NodeKind::Fact),
+            title: row.get(2)?,
+            body: row.get(3)?,
+            importance: row.get(4)?,
+            trust_score: row.get(5)?,
+            access_count: row.get(6)?,
+            created_at: row.get(7)?,
+            last_access: row.get(8)?,
+            decay_rate: row.get(9)?,
+            embedding: None,
         })
     })?;
     let mut result = Vec::new();
@@ -762,23 +759,4 @@ pub fn get_pending_notifications(
         result.push(r?);
     }
     Ok(result)
-}
-
-/// Mark a set of notification IDs as delivered.
-pub fn mark_notifications_delivered(conn: &Connection, ids: &[String]) -> Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let placeholders: Vec<String> = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
-    let sql = format!(
-        "UPDATE notifications SET delivered = 1 WHERE id IN ({})",
-        placeholders.join(", ")
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::types::ToSql> = ids
-        .iter()
-        .map(|s| s as &dyn rusqlite::types::ToSql)
-        .collect();
-    stmt.execute(&*params)?;
-    Ok(())
 }

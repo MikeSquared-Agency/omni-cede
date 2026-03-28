@@ -35,6 +35,8 @@ pub enum NodeKind {
     CronExecution,
     // Dynamic skills / plugins
     Skill,
+    // Notifications — delivered via graph, not a separate table
+    Notification,
     // Self-model — medium decay
     Pattern,
     Limitation,
@@ -61,6 +63,7 @@ impl NodeKind {
             Self::CronJob => "cron_job",
             Self::CronExecution => "cron_execution",
             Self::Skill => "skill",
+            Self::Notification => "notification",
             Self::Pattern => "pattern",
             Self::Limitation => "limitation",
             Self::Capability => "capability",
@@ -86,6 +89,7 @@ impl NodeKind {
             "cron_job" => Some(Self::CronJob),
             "cron_execution" => Some(Self::CronExecution),
             "skill" => Some(Self::Skill),
+            "notification" => Some(Self::Notification),
             "pattern" => Some(Self::Pattern),
             "limitation" => Some(Self::Limitation),
             "capability" => Some(Self::Capability),
@@ -104,6 +108,8 @@ impl NodeKind {
             Self::CronJob | Self::Skill => 0.0,
             // Cron executions decay fast like operational nodes
             Self::CronExecution => 0.05,
+            // Notifications decay fast (ephemeral once delivered)
+            Self::Notification => 0.05,
             // Operational nodes decay fast
             Self::Session | Self::Turn | Self::LlmCall
             | Self::ToolCall | Self::LoopIteration => 0.05,
@@ -121,6 +127,7 @@ impl NodeKind {
             Self::CronJob | Self::Skill => 0.8,
             Self::UserInput => 0.4,
             Self::CronExecution => 0.2,
+            Self::Notification => 0.3,
             Self::Session | Self::Turn | Self::LlmCall
             | Self::ToolCall | Self::LoopIteration => 0.2,
             _ => 0.5,
@@ -264,8 +271,15 @@ impl Node {
     }
 
     pub fn loop_iteration(iter: usize, session_id: &NodeId) -> Self {
-        Node::new(NodeKind::LoopIteration, format!("Iteration {iter}"))
+        let ts = crate::memory::format_timestamp(now_unix());
+        Node::new(NodeKind::LoopIteration, format!("[{ts}] Iteration {iter}"))
             .with_body(format!("session:{session_id}"))
+    }
+
+    pub fn notification(summary: impl Into<String>) -> Self {
+        let s = summary.into();
+        let ts = crate::memory::format_timestamp(now_unix());
+        Node::new(NodeKind::Notification, format!("[{ts}] {s}"))
     }
 
     pub fn fact_from_response(text: &str, _session_id: &NodeId) -> Self {
@@ -515,16 +529,6 @@ pub struct TurnContext {
     pub user_id: String,
     /// True when the message came from a group/channel (not a DM).
     pub is_group: bool,
-}
-
-/// A pending notification to be delivered on the user's next turn.
-#[derive(Debug, Clone)]
-pub struct Notification {
-    pub id: String,
-    pub session_id: String,
-    pub summary: String,
-    pub source_node_id: Option<String>,
-    pub created_at: i64,
 }
 
 // ─── Model backend ──────────────────────────────────────

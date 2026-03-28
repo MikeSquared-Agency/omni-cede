@@ -34,6 +34,7 @@ fn kind_color(kind: NodeKind) -> Color {
         NodeKind::Pattern | NodeKind::Limitation | NodeKind::Capability => Color::Green,
         NodeKind::BackgroundTask => Color::Blue,
         NodeKind::CronJob | NodeKind::CronExecution | NodeKind::Skill => Color::LightBlue,
+        NodeKind::Notification => Color::LightYellow,
     }
 }
 
@@ -78,6 +79,7 @@ fn node_category(kind: NodeKind) -> &'static str {
         NodeKind::BackgroundTask => "Tasks",
         NodeKind::CronJob | NodeKind::CronExecution => "Scheduler",
         NodeKind::Skill => "Skills",
+        NodeKind::Notification => "Notifications",
     }
 }
 
