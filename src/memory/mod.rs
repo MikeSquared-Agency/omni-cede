@@ -12,36 +12,11 @@ use crate::types::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Format a unix timestamp as a human-readable datetime string.
+/// Format a unix timestamp as a human-readable local datetime string.
 pub fn format_timestamp(unix: i64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-    let dt = UNIX_EPOCH + Duration::from_secs(unix as u64);
-    // Format as ISO-like: YYYY-MM-DD HH:MM:SS UTC
-    let secs_since_epoch = dt.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let days = secs_since_epoch / 86400;
-    let time_of_day = secs_since_epoch % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-    // Simple date calculation from days since epoch
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02} UTC")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let z = days_since_epoch + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S %Z").to_string())
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Format a relative time description (e.g., "2 hours ago", "3 days ago").
@@ -298,6 +273,23 @@ fn format_context_doc(nodes: &[ScoredNode], contradictions: &[ContradictionPair]
         .unwrap()
         .as_secs() as i64;
     doc.push_str(&format!("## Current time\n{}\n\n", format_timestamp(now_unix)));
+
+    // System environment — so the agent knows its runtime context
+    doc.push_str("## System environment\n");
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+        .unwrap_or_else(|_| "unknown".into());
+    let tz = chrono::Local::now().format("%Z (%:z)").to_string();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    doc.push_str(&format!(
+        "- Hostname: {hostname}\n- OS: {} {}\n- Timezone: {tz}\n- Working dir: {cwd}\n- Version: {}\n\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"),
+    ));
 
     // Who you are
     let identity: Vec<&ScoredNode> = nodes

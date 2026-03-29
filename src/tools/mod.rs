@@ -707,7 +707,7 @@ pub fn builtin_registry_core(
                     let mut out = format!("{} node(s):\n", nodes.len());
                     for n in &nodes {
                         let ts = chrono::DateTime::from_timestamp(n.created_at, 0)
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                            .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
                             .unwrap_or_else(|| "?".to_string());
                         out.push_str(&format!(
                             "- [{}] {} (id: {}, imp: {:.2}, created: {})\n",
@@ -1151,10 +1151,6 @@ pub fn builtin_registry_core(
                     "context": {
                         "type": "string",
                         "description": "Additional context or constraints (optional)"
-                    },
-                    "max_iterations": {
-                        "type": "integer",
-                        "description": "Max agent loop iterations (default: 10, max: 25)"
                     }
                 },
                 "required": ["task"]
@@ -1170,9 +1166,6 @@ pub fn builtin_registry_core(
                 Box::pin(async move {
                     let task = input["task"].as_str().unwrap_or("").to_string();
                     let context = input["context"].as_str().unwrap_or("").to_string();
-                    let max_iter = input["max_iterations"].as_u64()
-                        .unwrap_or(10)
-                        .min(25) as usize;
 
                     if task.is_empty() {
                         return Ok(ToolResult {
@@ -1218,8 +1211,7 @@ pub fn builtin_registry_core(
                             bg_config.clone(),
                         );
 
-                        let mut bg_agent_config = bg_config;
-                        bg_agent_config.max_iterations = max_iter;
+                        let bg_agent_config = bg_config;
 
                         let agent = crate::agent::orchestrator::Agent {
                             db: bg_db.clone(),
@@ -1306,10 +1298,6 @@ pub fn builtin_registry_core(
                     "task": {
                         "type": "string",
                         "description": "What the agent should do each time this fires. Be specific."
-                    },
-                    "max_iterations": {
-                        "type": "integer",
-                        "description": "Max agent loop iterations per execution (default: 5, max: 15)"
                     }
                 },
                 "required": ["name", "cron", "task"]
@@ -1321,7 +1309,6 @@ pub fn builtin_registry_core(
                     let name = input["name"].as_str().unwrap_or("Unnamed cron").to_string();
                     let cron_expr = input["cron"].as_str().unwrap_or("").to_string();
                     let task = input["task"].as_str().unwrap_or("").to_string();
-                    let max_iter = input["max_iterations"].as_u64().unwrap_or(5).min(15) as usize;
 
                     if cron_expr.is_empty() || task.is_empty() {
                         return Ok(ToolResult {
@@ -1364,7 +1351,6 @@ pub fn builtin_registry_core(
                     let meta = crate::scheduler::CronJobMeta {
                         cron: cron_expr.clone(),
                         task: task.clone(),
-                        max_iterations: max_iter,
                         enabled: true,
                         last_fired: 0,
                         user_id: session_owner.as_ref().map(|(u, _)| u.clone()),
@@ -1510,7 +1496,7 @@ pub fn builtin_registry_core(
                                 "never".to_string()
                             } else {
                                 chrono::DateTime::from_timestamp(m.last_fired, 0)
-                                    .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                                    .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z").to_string())
                                     .unwrap_or_else(|| "?".to_string())
                             };
                             out.push_str(&format!(

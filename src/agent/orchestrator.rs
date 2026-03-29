@@ -279,31 +279,7 @@ impl Agent {
                     return Ok(response.text);
                 }
             }
-
-            // Guard: max iterations
-            if iter >= self.config.max_iterations {
-                let limit_node = Node::new(NodeKind::Limitation, "Hit max iterations")
-                    .with_body(format!(
-                        "Task: {}. Stopped at {} iterations.",
-                        input, iter
-                    ))
-                    .with_importance(0.7)
-                    .with_decay_rate(0.02);
-                self.db
-                    .call(move |conn| queries::insert_node(conn, &limit_node))
-                    .await?;
-                break;
-            }
         }
-
-        // Max iterations reached — ask the LLM to summarise with full context
-        messages.push(Message::user(
-            "You've reached the maximum number of iterations for this task. \
-             Summarise what you accomplished so far and let the user know \
-             they can ask you to continue if needed. Be concise and natural."
-        ));
-        let wrap_up = self.llm.complete(&messages).await?;
-        Ok(wrap_up.text)
     }
 
     /// Run a single turn within an ongoing chat session.
@@ -464,6 +440,11 @@ impl Agent {
             for node in &pending {
                 let rel = memory::relative_time(node.created_at);
                 context_doc.push_str(&format!("- ({}) {}\n", rel, node.title));
+                if let Some(body) = &node.body {
+                    for line in body.lines() {
+                        context_doc.push_str(&format!("  {}\n", line));
+                    }
+                }
                 delivered_ids.push(node.id.clone());
             }
             context_doc.push('\n');
@@ -619,7 +600,6 @@ impl Agent {
                 let pending_calls: Vec<ToolCall> = response.tool_calls.clone();
                 let raw_content = response.raw_content.clone();
                 let response_text = response.text.clone();
-                let max_iterations = self.config.max_iterations;
 
                 // Spawn background task for tool execution + continuation
                 let handle = tokio::spawn(async move {
@@ -633,7 +613,6 @@ impl Agent {
                         response_text,
                         messages,
                         session_id.clone(),
-                        max_iterations,
                         auto_link_tx.clone(),
                     ).await;
 
@@ -752,8 +731,7 @@ impl Agent {
     ///
     /// This runs after `run_turn` has returned the first response to the user.
     /// It executes all pending tool calls, feeds results back to the LLM, and
-    /// continues until the LLM produces a final answer (EndTurn) or hits
-    /// max_iterations.
+    /// continues until the LLM produces a final answer (EndTurn).
     async fn background_tool_loop(
         db: Db,
         llm: Arc<dyn LlmClient>,
@@ -764,7 +742,6 @@ impl Agent {
         response_text: String,
         mut messages: Vec<Message>,
         session_id: String,
-        max_iterations: usize,
         auto_link_tx: async_channel::Sender<NodeId>,
     ) -> crate::error::Result<String> {
         // Push the assistant's response (with tool_use blocks)
@@ -781,20 +758,7 @@ impl Agent {
         Self::push_tool_results(&mut messages, tool_results);
 
         // Continue LLM loop
-        let mut iter: usize = 1; // already did iter 1 in run_turn
         loop {
-            iter += 1;
-            if iter > max_iterations {
-                // Max iterations in background — ask the LLM to wrap up
-                messages.push(Message::user(
-                    "You've reached the maximum number of iterations for this \
-                     background task. Summarise what you accomplished and what \
-                     remains. Be concise and natural."
-                ));
-                let wrap_up = llm.complete(&messages).await?;
-                return Ok(wrap_up.text);
-            }
-
             let response = if tool_defs.is_empty() {
                 llm.complete(&messages).await?
             } else {
@@ -813,7 +777,10 @@ impl Agent {
                         ));
                         match llm.complete(&messages).await {
                             Ok(summary) if !summary.text.trim().is_empty() => summary.text,
-                            _ => "Background task completed but produced no output.".to_string(),
+                            _ => {
+                                tracing::warn!("background task produced no summarizable output");
+                                String::new()
+                            }
                         }
                     } else {
                         response.text
