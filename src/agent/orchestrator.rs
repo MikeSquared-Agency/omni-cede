@@ -668,29 +668,41 @@ impl Agent {
                     }
                     let _ = auto_link_tx.try_send(bg_id.clone());
 
-                    // Write notification node so the user gets informed on next message
-                    let notif_node = Node::notification(&notif_summary);
-                    let notif_id = notif_node.id.clone();
-                    if let Err(e) = db.call({
-                        let n = notif_node;
-                        move |conn| queries::insert_node(conn, &n)
-                    }).await {
-                        tracing::error!("Failed to write notification node: {e}");
-                    }
-                    // Link notification → session via PartOf
-                    let notif_edge = Edge::new(notif_id.clone(), session_id.clone(), EdgeKind::PartOf);
-                    if let Err(e) = db.call(move |conn| queries::insert_edge(conn, &notif_edge)).await {
-                        tracing::error!("Failed to link notification to session: {e}");
-                    }
-                    // Also link notification → background task node via DerivesFrom
-                    let derives = Edge::new(notif_id, bg_id, EdgeKind::DerivesFrom);
-                    if let Err(e) = db.call(move |conn| queries::insert_edge(conn, &derives)).await {
-                        tracing::error!("Failed to link notification to bg task: {e}");
-                    }
+                    // Write notification node so the user gets informed —
+                    // but skip entirely if the result body is empty/whitespace
+                    // (nothing useful to deliver).
+                    let result_text = match &result {
+                        Ok(t) => t.trim(),
+                        Err(_) => "",
+                    };
+                    let has_content = !result_text.is_empty();
 
-                    // Fire event for immediate delivery
-                    if let Some(ref tx) = notif_tx {
-                        let _ = tx.send(NotifEvent { session_id: session_id.clone() });
+                    if has_content {
+                        let notif_node = Node::notification(&notif_summary);
+                        let notif_id = notif_node.id.clone();
+                        if let Err(e) = db.call({
+                            let n = notif_node;
+                            move |conn| queries::insert_node(conn, &n)
+                        }).await {
+                            tracing::error!("Failed to write notification node: {e}");
+                        }
+                        // Link notification → session via PartOf
+                        let notif_edge = Edge::new(notif_id.clone(), session_id.clone(), EdgeKind::PartOf);
+                        if let Err(e) = db.call(move |conn| queries::insert_edge(conn, &notif_edge)).await {
+                            tracing::error!("Failed to link notification to session: {e}");
+                        }
+                        // Also link notification → background task node via DerivesFrom
+                        let derives = Edge::new(notif_id, bg_id, EdgeKind::DerivesFrom);
+                        if let Err(e) = db.call(move |conn| queries::insert_edge(conn, &derives)).await {
+                            tracing::error!("Failed to link notification to bg task: {e}");
+                        }
+
+                        // Fire event for immediate delivery
+                        if let Some(ref tx) = notif_tx {
+                            let _ = tx.send(NotifEvent { session_id: session_id.clone() });
+                        }
+                    } else {
+                        tracing::warn!("Skipping notification — background task produced no content");
                     }
 
                     if let Err(e) = &result {
@@ -791,10 +803,26 @@ impl Agent {
 
             match response.stop_reason {
                 StopReason::EndTurn | StopReason::MaxTokens => {
+                    // If the LLM returned no text (e.g. only tool_use blocks
+                    // followed by an empty EndTurn), ask it to summarise.
+                    let final_text = if response.text.trim().is_empty() {
+                        messages.push(Message::assistant(&response.text));
+                        messages.push(Message::user(
+                            "The task is done. Summarise what you accomplished \
+                             and the key results. Be concise and natural."
+                        ));
+                        match llm.complete(&messages).await {
+                            Ok(summary) if !summary.text.trim().is_empty() => summary.text,
+                            _ => "Background task completed but produced no output.".to_string(),
+                        }
+                    } else {
+                        response.text
+                    };
+
                     // Store result in graph
                     let resp_ts = format_timestamp(crate::types::now_unix());
-                    let fact = Node::fact_from_response(&response.text, &session_id)
-                        .with_body(format!("[{resp_ts}] {}", response.text));
+                    let fact = Node::fact_from_response(&final_text, &session_id)
+                        .with_body(format!("[{resp_ts}] {}", final_text));
                     let fact_id = fact.id.clone();
                     db.call({
                         let f = fact;
@@ -802,7 +830,7 @@ impl Agent {
                     }).await?;
                     let derives = Edge::new(fact_id, session_id, EdgeKind::DerivesFrom);
                     db.call(move |conn| queries::insert_edge(conn, &derives)).await?;
-                    return Ok(response.text);
+                    return Ok(final_text);
                 }
                 StopReason::ToolUse => {
                     // More tool calls — execute them and keep going
