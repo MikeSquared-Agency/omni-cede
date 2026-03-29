@@ -3,8 +3,6 @@
 pub struct Config {
     /// Message count threshold before context compaction triggers.
     pub compaction_threshold: usize,
-    /// Maximum agent loop iterations before forced stop.
-    pub max_iterations: usize,
     /// Seconds between background decay sweeps.
     pub decay_interval_secs: u64,
     /// Minimum cosine similarity to create a `RelatesTo` auto-link edge.
@@ -42,7 +40,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             compaction_threshold: 20,
-            max_iterations: 10,
             decay_interval_secs: 60,
             auto_link_cosine_threshold: 0.75,
             contradiction_cosine_threshold: 0.85,

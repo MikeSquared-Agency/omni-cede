@@ -26,9 +26,6 @@ pub struct CronJobMeta {
     pub cron: String,
     /// The task prompt to run when the schedule fires.
     pub task: String,
-    /// Maximum agent loop iterations per execution (default 5).
-    #[serde(default = "default_max_iter")]
-    pub max_iterations: usize,
     /// Whether this job is active.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -43,7 +40,6 @@ pub struct CronJobMeta {
     pub channel: Option<String>,
 }
 
-fn default_max_iter() -> usize { 5 }
 fn default_enabled() -> bool { true }
 
 /// Run the scheduler loop. Call this from a `tokio::spawn`.
@@ -98,7 +94,7 @@ async fn tick(
         return Ok(());
     }
 
-    let now = chrono::Utc::now();
+    let now = chrono::Local::now();
     let now_ts = now.timestamp();
 
     for node in &cron_nodes {
@@ -133,7 +129,8 @@ async fn tick(
             true
         } else {
             let last_fired_dt = chrono::DateTime::from_timestamp(meta.last_fired, 0)
-                .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .with_timezone(&chrono::Local);
             // Check if any scheduled time exists between last_fired and now
             schedule
                 .after(&last_fired_dt)
@@ -186,7 +183,6 @@ async fn tick(
             node.id.clone(),
             node.title.clone(),
             meta.task.clone(),
-            meta.max_iterations,
             meta.user_id.clone(),
             meta.channel.clone(),
             notif_tx.clone(),
@@ -207,7 +203,6 @@ fn fire_cron_job(
     cron_job_id: NodeId,
     job_title: String,
     task: String,
-    max_iterations: usize,
     user_id: Option<String>,
     channel: Option<String>,
     notif_tx: Option<NotifTx>,
@@ -244,8 +239,7 @@ fn fire_cron_job(
             config.clone(),
         );
 
-        let mut agent_config = config;
-        agent_config.max_iterations = max_iterations;
+        let agent_config = config;
 
         let agent = crate::agent::orchestrator::Agent {
             db: db.clone(),
