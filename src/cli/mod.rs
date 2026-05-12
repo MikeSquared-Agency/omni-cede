@@ -733,6 +733,13 @@ fn build_llm_client(ollama_spec: &Option<String>) -> crate::error::Result<Arc<dy
         return Ok(Arc::new(crate::llm::OllamaClient::new(model, url)));
     }
 
+    // Check for GEMINI_API_KEY
+    if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        let model = std::env::var("GEMINI_MODEL")
+            .unwrap_or_else(|_| "gemini-1.5-flash".to_string());
+        return Ok(Arc::new(crate::llm::GeminiClient::new(key, model)));
+    }
+
     // Check for ANTHROPIC_API_KEY
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         let model = std::env::var("ANTHROPIC_MODEL")
@@ -741,6 +748,6 @@ fn build_llm_client(ollama_spec: &Option<String>) -> crate::error::Result<Arc<dy
     }
 
     Err(crate::error::CortexError::Config(
-        "No LLM backend configured. Set ANTHROPIC_API_KEY or use --ollama <model>".into(),
+        "No LLM backend configured. Set GEMINI_API_KEY, ANTHROPIC_API_KEY, or use --ollama <model>".into(),
     ))
 }
