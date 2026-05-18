@@ -435,12 +435,16 @@ impl GeminiClient {
                                         "name": block["name"],
                                         "args": block["input"]
                                     });
-                                    if let Some(ts) = block.get("thought_signature") {
-                                        func_call["thought_signature"] = ts.clone();
+                                    if let Some(id) = block.get("id") {
+                                        func_call["id"] = id.clone();
                                     }
-                                    parts.push(serde_json::json!({
+                                    let mut part_obj = serde_json::json!({
                                         "functionCall": func_call
-                                    }));
+                                    });
+                                    if let Some(ts) = block.get("thought_signature") {
+                                        part_obj["thoughtSignature"] = ts.clone();
+                                    }
+                                    parts.push(part_obj);
                                 } else if block["type"] == "text" {
                                     parts.push(serde_json::json!({"text": block["text"]}));
                                 }
