@@ -204,7 +204,7 @@ impl AnthropicClient {
                             tool_input = Some(input.clone());
                             tool_use_id = Some(id.clone());
                         }
-                        tool_calls.push(ToolCall { id, name, input });
+                        tool_calls.push(ToolCall { id, name, input, thought_signature: None });
                     }
                     _ => {}
                 }
@@ -305,6 +305,7 @@ impl OllamaClient {
                     id,
                     name,
                     input: arguments,
+                    thought_signature: None,
                 });
             }
         }
@@ -430,11 +431,15 @@ impl GeminiClient {
                             let mut parts = Vec::new();
                             for block in arr {
                                 if block["type"] == "tool_use" {
+                                    let mut func_call = serde_json::json!({
+                                        "name": block["name"],
+                                        "args": block["input"]
+                                    });
+                                    if let Some(ts) = block.get("thought_signature") {
+                                        func_call["thought_signature"] = ts.clone();
+                                    }
                                     parts.push(serde_json::json!({
-                                        "functionCall": {
-                                            "name": block["name"],
-                                            "args": block["input"]
-                                        }
+                                        "functionCall": func_call
                                     }));
                                 } else if block["type"] == "text" {
                                     parts.push(serde_json::json!({"text": block["text"]}));
@@ -535,8 +540,11 @@ impl GeminiClient {
                         } else if let Some(func) = part.get("functionCall") {
                             let name = func["name"].as_str().unwrap_or("").to_string();
                             let args = func["args"].clone();
-                            // Gemini doesn't return a specific call ID, so we generate one
-                            let id = format!("gemini_tc_{}_{i}", uuid::Uuid::new_v4().simple());
+                            let thought_signature = part.get("thoughtSignature").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            
+                            // Try to get ID from Gemini 3.1, fallback to generated ID
+                            let id = func.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("gemini_tc_{}_{i}", uuid::Uuid::new_v4().simple()));
                             
                             if tool_name.is_none() {
                                 tool_name = Some(name.clone());
@@ -548,6 +556,7 @@ impl GeminiClient {
                                 id,
                                 name,
                                 input: args,
+                                thought_signature,
                             });
                         }
                     }
@@ -571,12 +580,16 @@ impl GeminiClient {
                 blocks.push(serde_json::json!({ "type": "text", "text": text }));
             }
             for tc in &tool_calls {
-                blocks.push(serde_json::json!({
+                let mut tc_block = serde_json::json!({
                     "type": "tool_use",
                     "id": tc.id,
                     "name": tc.name,
                     "input": tc.input
-                }));
+                });
+                if let Some(ts) = &tc.thought_signature {
+                    tc_block["thought_signature"] = serde_json::json!(ts);
+                }
+                blocks.push(tc_block);
             }
             Some(serde_json::Value::Array(blocks))
         } else {
