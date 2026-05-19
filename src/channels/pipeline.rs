@@ -106,6 +106,12 @@ impl Pipeline {
             is_proactive: envelope.is_proactive,
         };
 
+        // Send initial typing indicator while agent thinks
+        let target = OutboundTarget::from_envelope(&envelope);
+        if let Some(ch) = self.registry.get(&target.channel).await {
+            let _ = ch.send_typing(&target).await;
+        }
+
         let mut reply = agent
             .run_turn(&managed.node_id, &envelope.text, &turn_ctx, envelope.media.as_ref())
             .await
